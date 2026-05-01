@@ -1,0 +1,44 @@
+{
+  "name": "@skytale/tally-mcp",
+  "version": "0.1.0",
+  "description": "Claude Code MCP plugin for Tally — encrypted multi-agent team coordination",
+  "license": "Apache-2.0",
+  "homepage": "https://skytale.sh",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicholasraimbault/tally.git",
+    "directory": "packages/mcp-plugin"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "tally-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test --import tsx test/server.test.ts",
+    "lint": "eslint src/ test/",
+    "format": "prettier --write src/ test/",
+    "format:check": "prettier --check src/ test/",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

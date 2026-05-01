@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "packages/runtime-sdk",
     "packages/role-pack",
-    "packages/mcp-plugin",
     "packages/cli",
 ]
 

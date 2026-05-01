@@ -17,8 +17,12 @@ Thumbs.db
 .env
 .env.local
 
-# Build outputs (future stages)
-/dist
-/node_modules
+# Build outputs
+node_modules/
+dist/
+*.tsbuildinfo
+.npm-debug.log*
+
+# Python (future stages)
 /__pycache__
 *.pyc

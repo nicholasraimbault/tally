@@ -1,0 +1,12 @@
+[package]
+name = "tally-runtime-sdk"
+description = "SDK for ephemeral executors running on the Tally runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true

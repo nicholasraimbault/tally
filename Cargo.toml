@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "packages/runtime-sdk",
+    "packages/role-pack",
+    "packages/mcp-plugin",
+    "packages/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Nicholas Raimbault <11843674+nicholasraimbault@users.noreply.github.com>"]
+repository = "https://github.com/nicholasraimbault/tally"
+homepage = "https://skytale.sh"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

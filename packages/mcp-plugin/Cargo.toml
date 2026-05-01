@@ -1,0 +1,12 @@
+[package]
+name = "tally-mcp-plugin"
+description = "Claude Code MCP plugin for Tally — exposes team coordination tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true

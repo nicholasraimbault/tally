@@ -20,7 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Stoa stack (via git dep until publishing setup lands per skytale issue #449)
-stoa-rs = { git = "https://github.com/nicholasraimbault/skytale", rev = "86ab999" }
+stoa-rs = { git = "https://github.com/nicholasraimbault/skytale", rev = "8534eaf" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

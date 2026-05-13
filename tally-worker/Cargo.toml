@@ -10,7 +10,6 @@ description = "Tally's Cloudflare Worker entry point. Implements the HTTP surfac
 crate-type = ["cdylib"]
 
 [dependencies]
-tally-core = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 worker = "0.5"
+# tally-core, serde, serde_json deferred to Workstream C tasks where
+# they're actually used.

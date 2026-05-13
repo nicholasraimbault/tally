@@ -1,0 +1,16 @@
+[package]
+name = "tally-worker"
+version = { workspace = true }
+edition = { workspace = true }
+license-file = { workspace = true }
+repository = { workspace = true }
+description = "Tally's Cloudflare Worker entry point. Implements the HTTP surface routing into TallyTeamDO."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tally-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+worker = "0.5"

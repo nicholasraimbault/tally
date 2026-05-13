@@ -1,0 +1,15 @@
+name = "tally"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-05-13"
+compatibility_flags = ["http_request_timeout"]
+
+# Worker entry point will be built from the worker crate by wrangler.
+# Durable Objects bindings will be added in subsequent Workstream C PRs.
+
+# [[durable_objects.bindings]]
+# name = "TALLY_TEAM_DO"
+# class_name = "TallyTeamDO"
+# script_name = "tally"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"

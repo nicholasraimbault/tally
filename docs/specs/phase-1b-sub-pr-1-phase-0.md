@@ -148,6 +148,8 @@ The Sub-PR 1 Phase 1 work creates the repo with a first commit containing:
 
 > **Phase 1 adaptation note (2026-05-13)**: §1.5 was originally specified with a workspace crate named `worker`. During Phase 1 execution, `cargo build --package worker` proved ambiguous because the load-bearing `worker = "0.5"` crates.io dep uses the same name (Cloudflare's official Rust SDK for Workers). The internal crate was renamed to `tally-worker` for namespace clarity (and symmetry with `tally-core`). The worker.rs SDK retains its canonical name in source code (`use worker::*;`). The file tree below reflects the post-rename state actually committed.
 
+> **Phase 1 adaptation note (2026-05-13)** — placeholder Cargo.toml dependencies: the original Workstream A spec (§4j and §4l of the prompt) specified `serde`, `serde_json`, and `tally-core` as dependencies of the placeholder `tally-core/Cargo.toml` and `tally-worker/Cargo.toml`, anticipating Workstream C usage. cargo-machete CI flagged these as currently unused (the placeholder `lib.rs` files don't yet use them). Resolution: the placeholder Cargo.toml files in the post-resolution commit contain only deps that are actually used (`worker = "0.5"` in tally-worker; none in tally-core). Workstream C tasks will add deps atomically with their actual use. The design intent at Phase 0 close is preserved here as historical context; the fix commit aligns the Cargo.toml files with the placeholder-crate intent (do nothing yet).
+
 ```
 tally/
 ├── README.md                   # elevator pitch + quickstart pointer

@@ -6,6 +6,5 @@ license-file = { workspace = true }
 repository = { workspace = true }
 description = "Shared types and HTTP-client logic for the Tally Cloudflare runtime and Tally CLI."
 
-# [dependencies] intentionally empty in this placeholder crate.
-# serde, serde_json, and other deps will be added by Workstream C
-# tasks (tally-core types PR) when they're actually used.
+[dependencies]
+serde = { workspace = true }

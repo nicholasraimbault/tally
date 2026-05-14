@@ -1,14 +1,22 @@
 //! Tally Cloudflare Worker entry point.
 //!
-//! The full router and DO bindings land in subsequent Workstream C PRs
-//! per the Sub-PR 1 Phase 0 design notes (`docs/specs/phase-1b-sub-pr-1-phase-0.md`).
-//! This first commit establishes the crate shape only.
+//! Worker-side routing translates public HTTP requests (per Sub-PR 1 Phase 0
+//! design notes §3.3) into Worker→DO RPC calls. The HTTP API surface
+//! implementation that performs the translation is deferred to a subsequent
+//! Workstream C PR per TallyTeamDO Phase 0 §9.2; this entry point currently
+//! responds with a placeholder.
 
 #![forbid(unsafe_code)]
 
 use worker::*;
 
+pub mod durable_object;
+pub mod rpc;
+pub mod wake_router;
+
 #[event(fetch)]
 async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {
-    Response::ok("Tally placeholder. Implementation in progress per Phase 1B Sub-PR 1.")
+    Response::ok(
+        "Tally placeholder. HTTP API surface implementation in progress per Phase 1B Sub-PR 1.",
+    )
 }

@@ -20,7 +20,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Stoa stack (via git dep until publishing setup lands per skytale issue #449)
-stoa-rs = { git = "https://github.com/nicholasraimbault/skytale", rev = "1527a7b" }
+stoa = { git = "https://github.com/nicholasraimbault/skytale", rev = "1527a7b" }
+
+# async-trait macro — used by tally-worker to implement Stoa's
+# WakeRouter trait (which is itself an `#[async_trait]` trait per
+# Workstream B' PR α). Version pinned to match skytale's pin for
+# consistency.
+async-trait = "0.1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1,8 +1,13 @@
-//! Shared types and HTTP-client logic for the Tally Cloudflare runtime
-//! and Tally CLI.
+//! Shared types for the Tally Cloudflare runtime and Tally CLI.
 //!
-//! This crate is intentionally minimal in the first commit; types and
-//! HTTP-client functions are added in subsequent Workstream C PRs per
-//! the Sub-PR 1 Phase 0 design notes (`docs/specs/phase-1b-sub-pr-1-phase-0.md`).
+//! Storage types for the `TallyTeamDO` state model land here so the
+//! runtime crate (`tally-worker`) and future consumers (Tally CLI,
+//! non-Cloudflare implementations) share a single canonical definition.
 
 #![forbid(unsafe_code)]
+
+pub mod team_meta;
+pub mod wake_record;
+
+pub use team_meta::TeamMeta;
+pub use wake_record::{WakeRecord, WakeState};

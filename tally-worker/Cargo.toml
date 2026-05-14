@@ -11,5 +11,24 @@ crate-type = ["cdylib"]
 
 [dependencies]
 worker = "0.5"
-# tally-core, serde, serde_json deferred to Workstream C tasks where
-# they're actually used.
+# Required for `#[durable_object]` macro expansion: the macro emits
+# `#[wasm_bindgen::prelude::wasm_bindgen]` (absolute attribute path),
+# which Rust 2018+ resolves at crate-root level. `worker = "0.5"` pulls
+# wasm-bindgen transitively but transitive deps aren't reachable via
+# crate-root attribute paths; this direct dep makes the name findable.
+# Version "0.2" unifies with worker's transitive resolution (0.2.121
+# at time of writing). Canonical pattern per cloudflare/workers-rs
+# test/Cargo.toml which declares wasm-bindgen alongside worker.
+wasm-bindgen = "0.2"
+tally-core = { workspace = true }
+stoa = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+
+# wasm-bindgen is invisible to cargo-machete because it's referenced
+# only via #[durable_object]'s macro expansion
+# (#[wasm_bindgen::prelude::wasm_bindgen] absolute attribute path)
+# rather than via source-level `use wasm_bindgen::...` statements. The
+# crate is required at crate root for attribute resolution.
+[package.metadata.cargo-machete]
+ignored = ["wasm-bindgen"]

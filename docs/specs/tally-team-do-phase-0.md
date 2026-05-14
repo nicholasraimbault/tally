@@ -211,7 +211,7 @@ async fn dispatch(
 `unimplemented!()` panics with explicit message. No partial input validation (no timeout-zero check, no UTF-8 validation on context). Partial work signals in-progress; scope-boundary should signal deferred.
 Callers attempting to invoke dispatch in this PR's deployed state will see the DO crash with the panic message. Worker-layer routing will translate this to HTTP 500 with the panic message in the response body. This is intentional — it's a development-time guard that the dispatch sub-PR hasn't landed yet; production deployment should follow dispatch sub-PR landing.
 ### 3.4 The `&mut self` impedance — no Mutex needed
-WakeRouter trait methods have mixed `&self` (dispatch) and `&mut self` (register_handler, unregister_handler) receivers. Cloudflare's DO single-writer guarantee plus async-trait's generated `Pin<Box<dyn Future + Send + '_>>` futures with appropriate lifetime bounds mean the implementation compiles without `Mutex<TallyTeamDO>` or similar wrapping.
+WakeRouter trait methods have mixed `&self` (dispatch) and `&mut self` (register_handler, unregister_handler) receivers. Cloudflare's DO single-writer guarantee plus async-trait's generated `Pin<Box<dyn Future + '_>>` futures with appropriate lifetime bounds mean the implementation compiles without `Mutex<TallyTeamDO>` or similar wrapping.
 The fetch handler calls trait methods sequentially in match arms; each await releases the borrow before the next call. No nested-borrow issues by construction.
 **If compilation reveals patterns I missed**: the implementation PR surfaces them as stop-and-surface findings rather than auto-adapting to `Mutex<>` or other patterns. Surfacing preserves the option for strategic-layer review before adopting structural workarounds.
 If compilation reveals async-trait + reborrowing patterns that require structural workarounds (`Mutex<>`, `RefCell<>`, manual lifetime annotations beyond what async-trait generates), the implementation PR stops at that finding and surfaces it for strategic-layer review *before* adopting the workaround. Adopting interior-mutability patterns has implications for §5's concurrency model documentation; the adoption decision is architectural, not a routine implementation choice.
@@ -434,9 +434,9 @@ This PR is complete when:
 7. Storage operations use the agreed key schema and Rust types
 8. Internal RPC types live in `tally-worker/src/rpc.rs`; shared storage types in `tally-core`
 9. wrangler.toml declares the DO binding and migration
-10. All CI jobs pass on tally main: Format, Clippy, Tests, Docs (strict), Unused dependencies, Worker build verification
-11. Cargo.toml dependencies updated to consume stoa-rs (the rev pin from #12 finally has a consumer)
-12. This is the first tally-worker PR that adds stoa-rs as a Cargo.toml dependency and actually consumes its trait surface in code. Prior rev-pin bumps were metadata-only; this PR makes Cargo.lock changes substantive for the first time, and future Workstream C PRs will follow the same substantive-rev-pin pattern.
+10. All CI jobs pass on tally main: Format, Clippy (with host and wasm32 steps), Tests (with host and wasm32 steps), Docs strict (with host and wasm32 steps), Unused dependencies, Worker build verification. CI workflow updated as part of this PR to split workspace-wide jobs by target internally.
+11. Cargo.toml dependencies updated to consume stoa (the rev pin from #15 finally has a consumer)
+12. This is the first tally-worker PR that adds stoa as a Cargo.toml dependency and actually consumes its trait surface in code. Prior rev-pin bumps were metadata-only; this PR makes Cargo.lock changes substantive for the first time, and future Workstream C PRs will follow the same substantive-rev-pin pattern.
 ## 11. Out of scope for Phase 0 deliberation
 Items that may surface during implementation but are not Phase 0 commitments:
 - Exact worker-rs API for `self.state.id()` and `DurableObjectId → String` conversion (implementation detail; pattern locked abstractly in §4.3)

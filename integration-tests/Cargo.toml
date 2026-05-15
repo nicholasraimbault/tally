@@ -1,0 +1,50 @@
+[package]
+name = "tally-integration-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "End-to-end integration tests for tally's public HTTP API surface. Standalone crate that drives a `wrangler dev` subprocess via reqwest. See `docs/specs/integration-tests-sub-pr-test-plan.md` for scope and scenario catalog."
+
+# Standalone crate — opts out of the workspace. Test-only dependencies
+# (reqwest, tokio with `full`) would inflate workspace compile time for
+# every other crate; the tally-worker crate also has a wasm32-only
+# target and dragging tokio's host-only features into its dep tree
+# breaks the wasm build. Skytale's `tests/agent_teams_e2e/` pattern.
+[workspace]
+
+[lib]
+name = "tally_integration_tests"
+path = "src/lib.rs"
+
+[dependencies]
+# HTTP client for talking to wrangler dev. `json` feature enables
+# .json() body builders + Response::json deserialization.
+reqwest = { version = "0.12", features = ["json"] }
+
+# Wire-format types for request/response bodies — defined inline in
+# this crate (not imported from tally-worker because tally-worker is a
+# wasm32-only cdylib whose host-target build would fail).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime for fixture setup (wrangler dev subprocess, /health
+# polling, HTTP calls). Tests use manually-managed runtimes (per the
+# skytale e2e pattern) rather than `#[tokio::test]`.
+tokio = { version = "1", features = ["full"] }
+
+# ULID for wake_id assertions in response bodies. tally returns
+# Crockford-base32 ULIDs; we use `Ulid::from_str` to verify the
+# response field parses as a well-formed ULID.
+ulid = "1"
+
+# URL-safe base64 encoding for identity bytes. The MVP bearer scheme
+# (per HTTP API surface sub-PR §9.2 Decision 1) interprets the bearer
+# as a URL-safe-base64 identity; tests construct identities by
+# generating random bytes and url-safe-b64 encoding them.
+base64 = "0.22"
+
+# Ergonomic error type for harness setup. The test crate is binary-
+# adjacent (test scaffolding) so anyhow is the right idiom per tally
+# repo convention (thiserror for library crates, anyhow for binary
+# crates).
+anyhow = "1"

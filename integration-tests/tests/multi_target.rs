@@ -109,14 +109,6 @@ fn multi_agent_same_team() {
 }
 
 #[test]
-#[ignore = "Same root cause as error_422_handler_not_found and \
-            unregister_handler: cross-team dispatch lands in T1's DO \
-            which has no registered handler for bob; expected 422 \
-            HandlerNotFound; actual 408 timeout because PR #17's \
-            dispatch_with_caller doesn't pre-check handler registration. \
-            Tracked at https://github.com/nicholasraimbault/tally/issues/21; \
-            follow-up fix-PR will add the pre-check and this #[ignore] \
-            is removed."]
 fn cross_team_isolation() {
     // Per test plan §"Scenario catalog" P2 #2: alice in T1 dispatches
     // to bob; T1's DO has no record of bob's registration (bob

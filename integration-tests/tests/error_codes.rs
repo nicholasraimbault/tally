@@ -345,14 +345,6 @@ fn error_410_already_terminal() {
 }
 
 #[test]
-#[ignore = "Pre-existing PR #17 implementation gap: dispatch_with_caller \
-            doesn't pre-check handler registration (Phase 0 Decision 9 \
-            spec'd it but PR #17 omitted it). Dispatches to unregistered \
-            (target, context) pairs return 408 timeout instead of 422 \
-            HandlerNotFound. Tracked at \
-            https://github.com/nicholasraimbault/tally/issues/21; a \
-            follow-up fix-PR will add the pre-check (~10 lines) and \
-            this #[ignore] is removed."]
 fn error_422_handler_not_found() {
     let runtime = rt();
     let harness = runtime

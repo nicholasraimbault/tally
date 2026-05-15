@@ -86,15 +86,6 @@ fn register_handler() {
 }
 
 #[test]
-#[ignore = "Same root cause as error_422_handler_not_found: this test's \
-            dispatch-after-unregister assertion expects 422 \
-            HandlerNotFound, but PR #17's dispatch_with_caller doesn't \
-            pre-check handler registration (Phase 0 Decision 9 spec'd \
-            it but PR #17 omitted it). Dispatches to unregistered \
-            (target, context) return 408 timeout instead of 422. \
-            Tracked at https://github.com/nicholasraimbault/tally/issues/21; \
-            follow-up fix-PR will add the pre-check and this #[ignore] \
-            is removed."]
 fn unregister_handler() {
     let runtime = rt();
     let harness = runtime

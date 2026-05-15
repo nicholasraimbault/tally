@@ -1,7 +1,12 @@
 name = "tally"
 main = "tally-worker/build/worker/shim.mjs"
 compatibility_date = "2026-05-03"
-compatibility_flags = ["http_request_timeout"]
+# compatibility_flags removed: `http_request_timeout` isn't recognized by
+# wrangler 4.92.0's workerd binary ("No such compatibility flag"). Per §9.2
+# Q2 verification, Cloudflare's default HTTP request behavior is unlimited
+# wall time while client is connected — no opt-in flag required for the
+# 300s long-poll dispatch pattern.
+compatibility_flags = []
 
 [[durable_objects.bindings]]
 name = "TALLY_TEAM_DO"

@@ -203,9 +203,27 @@ Existing 7 CI checks must continue to pass:
 - `cargo machete`
 
 Plus new:
-- **Integration tests** — `cargo test -p tally-integration-tests` against `wrangler dev` background process
+- **Integration tests crate (compile + lint)** — `cargo check --manifest-path integration-tests/Cargo.toml --tests`; `cargo clippy --manifest-path integration-tests/Cargo.toml --all-targets -- -D warnings`; `cargo fmt --check` (in `integration-tests/`). These verify the test crate compiles and is lint-clean without running `wrangler dev`.
 
-Local verification before PR open: run the full set including the new integration-tests step.
+**Deferred (blocked on worker-rs upgrade)**: actually executing the integration tests against `wrangler dev`. See § "CI execution status: blocked on worker-rs upgrade" below.
+
+## CI execution status: blocked on worker-rs upgrade
+
+The integration test scaffolding lands in this PR (standalone test crate at `integration-tests/`, `TestHarness` fixture, 16 scenarios catalogued and implemented as Rust test functions). The CI runtime that actually executes `wrangler dev` against the tests is **deferred** until a future sub-PR upgrades the `worker` dep from "0.5" to a current release compatible with present-day worker-build / wasm-bindgen-cli releases.
+
+**Concrete blocker**: tally pins `worker = "0.5"` (architectural commitment from prior sessions). The current toolchain doesn't compose cleanly with that pin:
+
+- `worker-build` 0.8.3 (latest) requires `worker >= 0.8.3`
+- `worker-build` 0.1.14 (older series, ostensibly compatible with worker 0.5) bundles `wasm-bindgen-cli` 0.2.105, which doesn't match tally's transitively-resolved `wasm-bindgen` 0.2.121 (different bindgen format)
+- No identified worker-build version cleanly bridges worker 0.5 and current wasm-bindgen
+
+Six fixes deep into PR #18 toolchain corrections during this PR, the cumulative pattern signaled that the foundation (worker 0.5 pin) doesn't compose with current tooling; one more version pin would just defer the next collision. The right move is to stop the cascade here and address the architectural premise in a separate sub-PR.
+
+**This PR's CI scope** (post-cleanup): the integration tests crate compiles + lints via a new `Integration tests crate (compile + lint)` CI job (does NOT run `wrangler dev`). The 7 pre-existing tally-worker CI jobs remain green.
+
+**Future sub-PR scope** (upgrade worker-rs): upgrade `worker = "0.5"` to current (≥ 0.8.3); resolve API breakage in tally-worker; update wrangler.toml compat flags; verify all of PR #17 + PR #18 behaviors hold; then re-enable the integration tests CI runtime (the test crate code in this PR will run as-is once the toolchain composes cleanly).
+
+Local verification before PR open: run the 7 tally-worker CI commands + 3 integration-tests-crate commands (10 checks).
 
 ## Mid-implementation correction note
 

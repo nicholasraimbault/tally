@@ -165,11 +165,6 @@ impl DurableObject for TallyTeamDO {
     /// empty).
     async fn alarm(&self) -> Result<Response> {
         let now_ms = Date::now().as_millis();
-        // [alarm_diag] temporary instrumentation for production verification
-        // of the alarm-fire path. Revert post-interpretation per PR #20
-        // pattern. Logs the entry point of alarm() so we can confirm the
-        // alarm handler fires at all (option c eliminated).
-        console_log!("[alarm_diag] alarm() invoked at now_ms={}", now_ms);
 
         let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
             .state
@@ -332,42 +327,18 @@ impl DurableObject for TallyTeamDO {
         // borrow as a habit-forming pattern — borrows don't compose with
         // future awaits). The next `.await` is `reschedule_alarm` below;
         // the borrow MUST be dropped before reaching it.
-        let resolver_sends: Vec<(oneshot::Sender<WakeResolverResult>, u32, WakeId)> = {
+        let resolver_sends: Vec<(oneshot::Sender<WakeResolverResult>, u32)> = {
             let mut resolvers = self.wake_resolvers.borrow_mut();
             transitions
                 .iter()
-                .filter_map(|dw| {
-                    // [alarm_diag] log per-wake whether the resolver is
-                    // present in the map. If success=false here, the
-                    // dispatching awaiter's resolver was either evicted
-                    // (DO restart) OR never persisted to this DO instance
-                    // (cross-DO-instance signal issue → option b).
-                    let resolver = resolvers.remove(&dw.wake_id);
-                    let success = resolver.is_some();
-                    console_log!(
-                        "[alarm_diag] resolver_lookup wake_id={} success={}",
-                        dw.wake_id,
-                        success
-                    );
-                    resolver.map(|s| (s, dw.timeout_ms, dw.wake_id))
-                })
+                .filter_map(|dw| resolvers.remove(&dw.wake_id).map(|s| (s, dw.timeout_ms)))
                 .collect()
             // `resolvers` borrow drops at end of scope.
         };
-        for (sender, timeout_ms, wake_id) in resolver_sends {
-            let send_result = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
+        for (sender, timeout_ms) in resolver_sends {
+            let _ = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
                 timeout: Duration::from_millis(timeout_ms as u64),
             })));
-            // [alarm_diag] log whether the send actually delivered. Err
-            // means the Receiver was dropped (awaiter abandoned the
-            // dispatch — e.g., client disconnected). Ok means the
-            // dispatching awaiter received the TimeoutExpired signal and
-            // should return promptly.
-            console_log!(
-                "[alarm_diag] send wake_id={} ok={}",
-                wake_id,
-                send_result.is_ok()
-            );
         }
 
         // Reschedule alarm to the next-earliest entry (or delete it).

@@ -184,10 +184,18 @@ jobs:
       # `wrangler dev --local` per test and tears it down on drop.
       # --test-threads=1 because tests share port 8787; parallel runs
       # would collide. cargo test's default is to run *test binaries*
-      # in parallel; --jobs=1 keeps build sequential but doesn't affect
-      # test-within-binary parallelism, which is what --test-threads
-      # controls.
+      # in parallel; --jobs 1 serializes both the build AND the test
+      # binaries themselves (one binary running at a time). Required
+      # to avoid port 8787 contention when 3 test binaries
+      # (error_codes, multi_target, happy_path) each spawn `wrangler
+      # dev` on the same default port. --test-threads=1 separately
+      # controls within-binary test parallelism.
+      #
+      # Latent issue from PR #19 — PR #20 masked it via #[ignore]
+      # count; PR #22's #[ignore] removals surfaced it. Serializing
+      # binaries is the bounded fix; per-binary port assignment would
+      # be needed at higher test-binary counts (~10+), not at 3.
       - name: Run integration tests
         run: |
-          cargo test --manifest-path integration-tests/Cargo.toml --tests \
+          cargo test --jobs 1 --manifest-path integration-tests/Cargo.toml --tests \
             -- --test-threads=1

@@ -18,4 +18,6 @@ new_classes = ["TallyTeamDO"]
 # worker-build must run from the tally-worker package directory; the
 # workspace root's Cargo.toml has no [package] section, which
 # worker-build rejects with "missing field `package`".
-command = "cargo install -q worker-build && cd tally-worker && worker-build --release"
+# Pin worker-build to 0.1.14 (compatible with worker = "0.5"); newer
+# worker-build versions require worker >= 0.8.3.
+command = "cargo install -q worker-build --version '0.1.14' && cd tally-worker && worker-build --release"

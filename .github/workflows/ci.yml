@@ -154,7 +154,10 @@ jobs:
       # directory (the workspace root's Cargo.toml has no [package]
       # section).
       - name: Install worker-build
-        run: cargo install -q worker-build --locked
+        # Pin to a worker-build version compatible with worker = "0.5"
+        # (the tally-worker dep version). worker-build 0.8.x requires
+        # worker >= 0.8.3; upgrading worker is out of scope for this PR.
+        run: cargo install -q worker-build --version "0.1.14" --locked
       - name: Build worker (release)
         working-directory: tally-worker
         run: worker-build --release

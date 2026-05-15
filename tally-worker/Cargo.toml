@@ -69,6 +69,13 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
+# thiserror: HTTP API surface sub-PR Decision 4 introduces
+# `TallyError` (a `#[derive(thiserror::Error)]` wrapper around
+# `StoaError` for tally-implementation-specific cases that don't
+# belong in stoa's dispatch-scoped `WakeError`). Version matches
+# stoa's "2" pin for consistency.
+thiserror = "2"
+
 # getrandom 0.3 (transitive via ulid) requires the `wasm_js` feature on
 # the wasm32-unknown-unknown target — otherwise the build fails with
 # "The wasm32-unknown-unknown targets are not supported by default".

@@ -105,7 +105,7 @@ fn json_error_response(status: u16, error: &str) -> Result<Response> {
 /// The Worker reaches the TallyTeamDO namespace via
 /// `env.durable_object(DO_BINDING)`. The string is a binding name (not
 /// a class name) per Cloudflare's wrangler.toml convention.
-const DO_BINDING: &str = "tally-team";
+const DO_BINDING: &str = "TALLY_TEAM_DO";
 
 /// Worker entry point — routes requests through the `Router` table and
 /// returns the resulting `Response`.
@@ -176,13 +176,19 @@ fn parse_bearer(req: &Request) -> Result<Option<String>> {
 
 /// Look up the TallyTeamDO stub for a given `team_id` path parameter.
 ///
-/// Per Phase 0 §4.3 the DO ID is the hex stringified form of the
-/// `State::id()`. The Worker accepts the same hex form as the URL
-/// `{team_id}` path segment; on malformed hex the Cloudflare runtime
-/// raises an error which we surface as 400.
+/// Per Phase 0 §3.2, `team_id` is a URL-safe identifier the caller
+/// provides; the DO ID is derived server-side via Cloudflare's
+/// `id_from_name` (internal SHA-256 hash of the name). This accepts
+/// any UTF-8 string for `team_id`; identical names always map to the
+/// same DO instance (the routing primitive callers rely on).
+///
+/// Earlier draft used `id_from_string`, which requires a 64-hex DO ID
+/// from `State::id()`'s stringified form — incompatible with
+/// caller-provided URL-safe team_ids. Corrected during §9.3
+/// integration-test implementation (this PR).
 fn lookup_stub(env: &Env, team_id: &str) -> Result<worker::Stub> {
     let namespace = env.durable_object(DO_BINDING)?;
-    namespace.id_from_string(team_id)?.get_stub()
+    namespace.id_from_name(team_id)?.get_stub()
 }
 
 /// Internal Worker→DO RPC: `/validate_api_key`. See

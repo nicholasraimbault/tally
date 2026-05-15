@@ -195,9 +195,10 @@ The Tally CLI's Cargo.toml will declare:
 | `tally agents register --team <id> --identity <bytes>` | Agent | Register this agent's identity with Tally's WakeRouter |
 | `tally agents unregister --team <id> --identity <bytes>` | Agent | Clean shutdown |
 | `tally agents key issue --team <id> --identity <bytes>` | Agent | Issue an API key for this agent's MCP server |
+| `tally agents key revoke --team <id> --identity <bytes>` | Agent | Revoke an issued API key (MVP: no-op against uniform-true validation; Phase 2 wires real key tracking) |
 | `tally version` | Diagnostic | Print Tally version, Stoa trait surface version, runtime endpoint |
 
-Approximately 10 commands. Slightly larger surface than skytale CLI's team commands; appropriate for an operator-tool binary.
+11 commands total (10 from the original table + `agents key revoke` added in the CLI sub-PR for consistency with this section's auth-model text, which references revocation but the original table had omitted). Slightly larger surface than skytale CLI's team commands; appropriate for an operator-tool binary.
 
 ### Sub-product 4: Tally documentation
 

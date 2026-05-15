@@ -141,6 +141,40 @@ jobs:
         working-directory: integration-tests
         run: cargo fmt --check
 
+  cli-crate-checks:
+    name: Tally CLI crate (compile + lint + test + doc)
+    runs-on: ubuntu-latest
+    # Standalone crate at cli/ (opts out of workspace per
+    # cli-sub-pr-phase-0.md D1). Checks parallel
+    # integration-tests-crate-checks but additionally run tests and
+    # doc since the CLI's smoke tests are host-target executable
+    # without needing wrangler.
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+      - name: cargo check (cli crate)
+        run: cargo check --manifest-path cli/Cargo.toml --tests
+      - name: cargo clippy (cli crate)
+        run: cargo clippy --manifest-path cli/Cargo.toml --all-targets -- -D warnings
+      - name: cargo fmt --check (cli crate)
+        working-directory: cli
+        run: cargo fmt --check
+      - name: cargo test (cli crate)
+        run: cargo test --manifest-path cli/Cargo.toml --tests
+      - name: cargo doc --no-deps (cli crate)
+        run: cargo doc --manifest-path cli/Cargo.toml --no-deps
+
   integration-tests:
     name: Integration tests
     runs-on: ubuntu-latest

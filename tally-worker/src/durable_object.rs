@@ -14,6 +14,10 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use worker::*;
+// `DurableObject` is no longer brought into scope via `use worker::*` as of
+// worker-rs 0.7.0 (per release notes / PR #872) — it must be imported
+// explicitly so multiple DOs in the same file work correctly.
+use worker::DurableObject;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;

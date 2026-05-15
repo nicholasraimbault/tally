@@ -10,10 +10,10 @@ description = "Tally's Cloudflare Worker entry point. Implements the HTTP surfac
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "0.5"
+worker = "0.8.3"
 # Required for `#[durable_object]` macro expansion: the macro emits
 # `#[wasm_bindgen::prelude::wasm_bindgen]` (absolute attribute path),
-# which Rust 2018+ resolves at crate-root level. `worker = "0.5"` pulls
+# which Rust 2018+ resolves at crate-root level. `worker = "0.8.x"` pulls
 # wasm-bindgen transitively but transitive deps aren't reachable via
 # crate-root attribute paths; this direct dep makes the name findable.
 # Version "0.2" unifies with worker's transitive resolution (0.2.121

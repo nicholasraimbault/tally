@@ -6,7 +6,9 @@ compatibility_flags = ["http_request_timeout"]
 [[durable_objects.bindings]]
 name = "TALLY_TEAM_DO"
 class_name = "TallyTeamDO"
-script_name = "tally"
+# script_name omitted: that field references a DO defined in a different
+# Worker; TallyTeamDO is defined in this Worker, so self-reference is
+# redundant and confuses wrangler dev's binding resolution.
 
 [[migrations]]
 tag = "v1"

@@ -268,17 +268,13 @@ impl TestHarness {
     /// raw 16-byte payloads (32 bytes total) and hex-encode them to
     /// produce a fresh, well-formed 64-hex team_id per call.
     ///
-    /// Note: by using `id_from_string` (rather than `id_from_name`),
-    /// each test gets a distinct DO instance with no shared state —
-    /// which is exactly what test isolation requires.
+    /// Returns a fresh ULID string per call; Cloudflare's `id_from_name`
+    /// (which `lookup_stub` calls) derives the DO instance via SHA-256
+    /// hash of the name, so identical names map to identical DOs and
+    /// distinct names map to distinct DOs. Fresh ULIDs guarantee test
+    /// isolation between scenarios.
     pub fn new_team_id(&self) -> String {
-        let a = ulid::Ulid::new().to_bytes();
-        let b = ulid::Ulid::new().to_bytes();
-        let mut out = String::with_capacity(64);
-        for byte in a.iter().chain(b.iter()) {
-            out.push_str(&format!("{:02x}", byte));
-        }
-        out
+        ulid::Ulid::new().to_string()
     }
 
     // ─── HTTP helpers ─────────────────────────────────────────────────

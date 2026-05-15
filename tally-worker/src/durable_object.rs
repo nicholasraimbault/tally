@@ -158,20 +158,6 @@ impl DurableObject for TallyTeamDO {
     /// empty).
     async fn alarm(&self) -> Result<Response> {
         let now_ms = Date::now().as_millis();
-        // DIAG (temporary, for PR #20 failure 1 diagnosis):
-        let resolvers_count = self.wake_resolvers.borrow().len();
-        let resolver_ids: Vec<String> = self
-            .wake_resolvers
-            .borrow()
-            .keys()
-            .map(|k| k.to_string())
-            .collect();
-        console_log!(
-            "[alarm_diag] alarm() invoked at {}ms; wake_resolvers count={} ids={:?}",
-            now_ms,
-            resolvers_count,
-            resolver_ids
-        );
 
         let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
             .state
@@ -334,41 +320,18 @@ impl DurableObject for TallyTeamDO {
         // borrow as a habit-forming pattern — borrows don't compose with
         // future awaits). The next `.await` is `reschedule_alarm` below;
         // the borrow MUST be dropped before reaching it.
-        let resolver_sends: Vec<(oneshot::Sender<WakeResolverResult>, u32, WakeId)> = {
+        let resolver_sends: Vec<(oneshot::Sender<WakeResolverResult>, u32)> = {
             let mut resolvers = self.wake_resolvers.borrow_mut();
             transitions
                 .iter()
-                .filter_map(|dw| {
-                    let removed = resolvers.remove(&dw.wake_id);
-                    // DIAG (temporary, for PR #20 failure 1 diagnosis):
-                    console_log!(
-                        "[alarm_diag] wake_id={} lookup in resolvers: {}",
-                        dw.wake_id,
-                        if removed.is_some() {
-                            "FOUND"
-                        } else {
-                            "MISSING"
-                        }
-                    );
-                    removed.map(|s| (s, dw.timeout_ms, dw.wake_id))
-                })
+                .filter_map(|dw| resolvers.remove(&dw.wake_id).map(|s| (s, dw.timeout_ms)))
                 .collect()
             // `resolvers` borrow drops at end of scope.
         };
-        for (sender, timeout_ms, wake_id) in resolver_sends {
-            let send_result = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
+        for (sender, timeout_ms) in resolver_sends {
+            let _ = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
                 timeout: Duration::from_millis(timeout_ms as u64),
             })));
-            // DIAG (temporary, for PR #20 failure 1 diagnosis):
-            console_log!(
-                "[alarm_diag] wake_id={} send result: {}",
-                wake_id,
-                if send_result.is_ok() {
-                    "OK"
-                } else {
-                    "RECEIVER_DROPPED"
-                }
-            );
         }
 
         // Reschedule alarm to the next-earliest entry (or delete it).
@@ -880,11 +843,6 @@ impl TallyTeamDO {
         // RefCell discipline: scoped borrow_mut, dropped before the next
         // `.await` (reschedule_alarm). The borrow is purely synchronous.
         self.wake_resolvers.borrow_mut().insert(wake_id, sender);
-        // DIAG (temporary, for PR #20 failure 1 diagnosis):
-        console_log!(
-            "[alarm_diag] dispatch_with_caller inserted wake_id={} into wake_resolvers",
-            wake_id
-        );
 
         // Reschedule alarm to the new earliest entry. The queue is
         // non-empty (just added our entry); but reschedule_alarm

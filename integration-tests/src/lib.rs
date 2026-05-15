@@ -153,13 +153,8 @@ impl TestHarness {
             // Inherit stderr/stdout to surface wrangler build errors
             // during local development. CI captures via the workflow
             // step's log output.
-            // DIAG: inherit (instead of pipe) so wrangler dev's stdout/stderr
-            // (including worker `console_log!` output) flows to the test
-            // process's stdout. This makes alarm_diag logs visible in CI's
-            // captured test output. Temporary — pipe semantics will return
-            // when diagnostic logging is removed.
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             // Best-effort cleanup if test panics before TestHarness drop runs.
             .kill_on_drop(true)
             .spawn()

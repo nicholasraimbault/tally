@@ -118,16 +118,6 @@ jobs:
       - name: cargo build (tally-worker crate, wasm32)
         run: cargo build --package tally-worker --target wasm32-unknown-unknown
 
-  # Integration tests job removed pending worker-rs upgrade.
-  # The test crate scaffolding (integration-tests/) is in this PR; its
-  # compilation and lints are covered by the existing Tests / Clippy /
-  # Format / Docs (strict) jobs above (which include the standalone
-  # crate via cargo check --manifest-path). The CI runtime that actually
-  # spawns `wrangler dev` against the tests is deferred until the worker
-  # dep is upgraded from "0.5" to a current release. See
-  # docs/specs/integration-tests-sub-pr-test-plan.md § "CI execution
-  # status: blocked on worker-rs upgrade" for the concrete blocker.
-
   integration-tests-crate-checks:
     name: Integration tests crate (compile + lint)
     runs-on: ubuntu-latest
@@ -150,3 +140,54 @@ jobs:
       - name: cargo fmt --check (integration-tests crate)
         working-directory: integration-tests
         run: cargo fmt --check
+
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    # Realistic budget per `docs/specs/integration-tests-sub-pr-test-plan.md`:
+    # wrangler install ~10-15s; worker-build ~10-20s; wrangler dev startup
+    # ~3-5s; 16 sequential HTTP tests at ~1-2s each ≈ 16-32s; alarm-fire
+    # real-wait scenarios ~5-7s. Total ~1 minute cold-cache.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Wrangler
+        run: npm install -g wrangler
+      - name: Install Rust (wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+      # Pre-build the worker so wrangler dev doesn't need to compile
+      # on first request (which would push past the harness's 30s
+      # readiness timeout). worker-build emits to build/worker/shim.mjs
+      # — the wrangler.toml `main` entry. Latest worker-build (0.8.x)
+      # is matched to `worker = "0.8.3"` automatically (worker-rs
+      # 0.7.0+ major-version-locks the binary and library together).
+      - name: Install worker-build
+        run: cargo install -q worker-build --locked
+      - name: Build worker (release)
+        working-directory: tally-worker
+        run: worker-build --release
+      # Run the standalone test crate. The harness internally spawns
+      # `wrangler dev --local` per test and tears it down on drop.
+      # --test-threads=1 because tests share port 8787; parallel runs
+      # would collide. cargo test's default is to run *test binaries*
+      # in parallel; --jobs=1 keeps build sequential but doesn't affect
+      # test-within-binary parallelism, which is what --test-threads
+      # controls.
+      - name: Run integration tests
+        run: |
+          cargo test --manifest-path integration-tests/Cargo.toml --tests \
+            -- --test-threads=1

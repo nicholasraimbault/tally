@@ -1232,11 +1232,39 @@ impl TallyTeamDO {
     async fn reschedule_alarm(&self, alarm_queue: &BTreeMap<u64, Vec<WakeId>>) -> Result<()> {
         match alarm_queue.keys().next() {
             Some(earliest_ms) => {
-                // `ScheduledTime: From<i64>` interprets the value as unix
-                // milliseconds. Saturating cast guards against u64 values
-                // exceeding i64::MAX (well outside any realistic clock).
-                let scheduled_ms: i64 = (*earliest_ms).try_into().unwrap_or(i64::MAX);
-                self.state.storage().set_alarm(scheduled_ms).await
+                // worker-rs's `ScheduledTime` accepts three conversion paths:
+                //   - `From<i64>`:           interpreted as offset-ms-from-`Date::now()`
+                //   - `From<Duration>`:      interpreted as offset
+                //   - `From<DateTime<Utc>>`: interpreted as absolute time
+                //
+                // `alarm_queue` stores absolute unix-millisecond timestamps.
+                // We compute the offset from `Date::now()` and pass via
+                // `Duration` so the offset semantic is pinned at the type
+                // level (rather than the type-ambiguous `i64` path).
+                //
+                // **Provenance correction (alarm-fire-diag branch):** an
+                // earlier version of this site passed the absolute unix-ms
+                // value directly as an `i64`, with a comment that
+                // incorrectly asserted `From<i64>` was interpreted as
+                // absolute unix-ms. That misreading caused alarms to be
+                // scheduled for `Date::now() + <absolute_unix_ms>` ≈ year
+                // 57,000 CE — never firing within any realistic test
+                // window. See the alarm-fire-diag PR's body for the full
+                // misdiagnosis-chain provenance.
+                //
+                // Saturating arithmetic guards against u64 -> i64 wrap
+                // (irrelevant for current epoch but cheap correctness).
+                // `.max(0)` clamps past-due alarms to "fire immediately"
+                // per Cloudflare's documented behaviour ("If `set_alarm()`
+                // is called with a time equal to or before Date.now(),
+                // the alarm will be fired as soon as possible").
+                let now_ms = Date::now().as_millis() as i64;
+                let earliest_i64 = (*earliest_ms) as i64;
+                let offset_ms = earliest_i64.saturating_sub(now_ms).max(0) as u64;
+                self.state
+                    .storage()
+                    .set_alarm(Duration::from_millis(offset_ms))
+                    .await
             }
             None => self.state.storage().delete_alarm().await,
         }

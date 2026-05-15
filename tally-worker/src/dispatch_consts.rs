@@ -23,11 +23,14 @@ pub const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 /// Per-target inbox cap per Phase 0 §3.2. Overflow evicts the head (FIFO oldest).
 pub const INBOX_LIMIT: usize = 1_000;
 
-/// Safety buffer on dispatch's [`tokio::time::timeout`] wrapper (Decision 9).
+/// Safety buffer on dispatch's `worker::Delay` safety wrapper (Decision 9).
 ///
 /// The alarm-based timeout is the primary timeout mechanism; this is the
 /// defensive backstop bounding the in-memory await if the alarm path
 /// somehow fails to resolve the wake (DO restart, implementation bug, etc.).
+/// `tokio::time::timeout` is unavailable on `wasm32-unknown-unknown` (no
+/// timer driver); the wrapper races the oneshot Receiver against
+/// [`worker::Delay`] via `futures::future::select` instead.
 pub const SAFETY_BUFFER: Duration = Duration::from_secs(5);
 
 // Compile-time invariant assertions per Phase 0 in-scope unit-test surface

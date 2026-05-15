@@ -14,12 +14,14 @@ Implements the public HTTP API surface fronting TallyTeamDO. In scope:
 - Long-poll trigger via `inbox_waiters` subscription (single-waiter per identity)
 - §3.1 error code mapping corrections + new `TallyError` wrapper covering complete_wake's tally-specific cases (refines §9.1's Decision 6.6.4)
 - `?identity=` query-param removal from `handle_read_inbox` (Decision 11 of §9.1 was an explicit deferred compromise)
+- **F.1 expansion (locked mid-implementation):** Public/internal wire-format translation made load-bearing rather than glossed (see §"Wire-format API contracts" §F.1 below). Adds Public* types in `rpc.rs`, refines internal `DispatchResponse` (§9.1 mid-implementation correction adding `wake_id` + `completed_at`), refines internal `WakeSummary` (adds `expires_at_ms`), refines `complete_wake` return type to `Result<u64, TallyError>`, refines `dispatch_with_caller` return type to `(Option<WakeId>, Result<(WakeResponse, u64), StoaError>)`, introduces ISO-8601 formatter for ms→string conversion at the Worker boundary, introduces structured-JSON error response bodies with contextual fields per §3.3.
 
 Deferred:
 - §9.3 integration tests sub-PR: end-to-end HTTP flow tests
 - Phase 2 admin tooling: real API key validation (this PR keeps the MVP uniform-true pattern but establishes the validate_api_key RPC seam)
+- Phase 2 register metadata storage (Public `metadata` field is accepted at the public contract but currently dropped at the Worker; DO has no `agent:{identity}:metadata` storage in this PR)
 
-The design rests on 4 architectural decisions; mechanical items follow §3.3 + §3.8 spec verbatim.
+The design rests on 4 architectural decisions; mechanical items follow §3.3 + §3.8 spec verbatim with the F.1 expansion specifying the public/internal translation explicitly.
 
 ## Architectural decisions
 
@@ -188,6 +190,24 @@ pub enum TallyError {
 
 **Honest acknowledgment:** this refines §9.1's Decision 6.6.4, which used StoaError throughout complete_wake. The §9.1 deliberation didn't catch the WakeError misuse; §9.2's error-mapping inspection did. The correction lands as part of §9.2's PR rather than as a separate retroactive correction to §9.1's merged code.
 
+**Second §9.1 mid-implementation correction (F.1 expansion):** §9.1's `DispatchResponse` carried only `responding_identity_b64 + response_payload_b64`. The public response shape from `phase-1b-sub-pr-1-phase-0.md` §3.3 specifies `{ wake_id, response, completed_at }` — `wake_id` and `completed_at` weren't reachable from §9.1's internal shape, so the Worker's public-shape translation had no source data. The F.1 expansion (locked during this PR's implementation, mid-stop-and-surface) refines the internal `DispatchResponse` to:
+
+```rust
+#[derive(Debug, Serialize)]
+pub struct DispatchResponse {
+    pub wake_id: WakeId,                    // NEW (F.1)
+    pub responding_identity_b64: String,
+    pub response_payload_b64: String,
+    pub completed_at: u64,                  // NEW (F.1; unix ms)
+}
+```
+
+`complete_wake`'s return type also revises: from `Result<(), TallyError>` to `Result<u64, TallyError>`. The `Ok` arm carries the `completed_at` value (storage-write timestamp captured immediately after `put_multiple_raw` succeeds). The oneshot resolver channel payload changes from `Result<WakeResponse, StoaError>` to `Result<(WakeResponse, u64), StoaError>`; the success-case tuple flows from `complete_wake` through the channel to `dispatch_with_caller`'s awaiting caller. `WakeRecord` stays at 9 fields — `completed_at` is ephemeral coordination data, not persistent state.
+
+`dispatch_with_caller`'s return type also revises: from `Result<WakeResponse, StoaError>` to `(Option<WakeId>, Result<(WakeResponse, u64), StoaError>)`. The leading `Option<WakeId>` lets the error mapper populate `wake_id` in §3.3's structured timeout response (`{ "error": "wake timed out", "wake_id": "...", "timeout_seconds": <n> }`) — `None` for pre-generation validation errors, `Some(_)` once the wake_id has been generated (including the timeout path).
+
+This correction is structurally analogous to the §9.1 tokio::time correction (commit `494721b`): a Layer-4 representative-use lesson surfaced during implementation, locked at strategic layer, applied inline rather than as a separate retroactive PR.
+
 ## Wire-format API contracts (per §3.3 verbatim)
 
 The 6 public routes:
@@ -201,7 +221,87 @@ The 6 public routes:
 | POST | `/v1/teams/{team_id}/wakes/{wake_id}/complete` | `POST /complete` |
 | GET | `/v1/health` | (Worker-only; no DO) |
 
-Request/response JSON shapes are specified in `phase-1b-sub-pr-1-phase-0.md` §3.3 and locked verbatim — not restated here. The Worker layer translates public HTTP requests into the internal DO request shapes (which are §9.1's `RegisterRequest`, `UnregisterRequest`, `DispatchRequest`, `CompleteRequest` plus the new `ValidateApiKeyRequest`).
+Request/response JSON shapes are specified in `phase-1b-sub-pr-1-phase-0.md` §3.3 and locked verbatim — not restated here. **The Worker layer's public/internal wire-format translation is load-bearing.** Public types differ from §9.1's internal RPC types on field names (`_b64` suffix dropped on public), units (seconds vs milliseconds; ISO-8601 vs unix-millis), and identity provenance (injected from authenticated bearer or URL path on public, present in body on internal). The translation site is `tally-worker/src/lib.rs`; the type definitions for both sides coexist in `tally-worker/src/rpc.rs`.
+
+#### F.1 expansion: public/internal type coexistence (Option F.1)
+
+The earlier framing of this section glossed over the translation as a mechanical detail. The F.1 expansion (locked during implementation, mid-stop-and-surface) names the translation as load-bearing and specifies:
+
+1. **Public types live alongside internal types in `tally-worker/src/rpc.rs`.** Internal RPC types from §9.1 (`RegisterRequest`, `UnregisterRequest`, `DispatchRequest`, `CompleteRequest`, `DispatchResponse`, `ReadInboxResponse`, `WakeSummary`) stay unchanged except for the §9.1 mid-implementation correction described in Decision 4 (DispatchResponse gains `wake_id` + `completed_at`; WakeSummary gains `expires_at_ms`). New Public* types:
+
+   ```rust
+   pub struct PublicDispatchRequest {
+       pub target_identity: String,    // no _b64 suffix
+       pub context_id: String,
+       pub payload: String,            // no _b64 suffix
+       pub timeout_seconds: u32,       // seconds, not ms
+   }
+   pub struct PublicCompleteRequest { pub response: String }
+   pub struct PublicRegisterRequest {
+       pub context_id: String,
+       pub metadata: Option<serde_json::Value>,
+   }
+   pub struct PublicDispatchResponse {
+       pub wake_id: String,
+       pub response: String,
+       pub completed_at: String,       // ISO-8601 UTC second-precision
+   }
+   pub struct PublicReadInboxResponse {
+       pub wakes: Vec<PublicWakeSummary>,
+       pub more_available: bool,
+   }
+   pub struct PublicWakeSummary {
+       pub wake_id: String,
+       pub caller_identity: String,    // no _b64 suffix
+       pub context_id: String,
+       pub payload: String,            // no _b64 suffix
+       pub expires_at: String,         // ISO-8601 UTC
+   }
+   pub struct PublicRegisterResponse { pub registered: bool, pub context_id: String }
+   pub struct PublicCompleteResponse { pub completed: bool, pub wake_id: String }
+   ```
+
+2. **Worker translation per route:** for each authenticated route the Worker (a) deserializes the public body; (b) constructs the internal DO RPC body (field-name renames, unit conversions, authenticated-identity injection); (c) forwards via DO RPC; (d) deserializes the DO's success body; (e) translates back to the public response shape; (f) returns the response.
+
+   Specific dispatch translations:
+   - `target_identity` → `target_identity_b64`
+   - `payload` → `payload_b64`
+   - `timeout_seconds * 1000` → `timeout_ms`
+   - inject `caller_identity_b64` from authenticated identity
+   - `wake_id: WakeId` (internal) → `wake_id: String`
+   - `response_payload_b64` → `response`
+   - `completed_at: u64` (unix ms) → `completed_at: String` (ISO-8601 UTC)
+   - `responding_identity_b64` is internal-only; dropped from public.
+
+   Specific complete translations:
+   - `response` → `response_payload_b64`
+   - inject `wake_id` from URL path; inject `by_identity_b64` from authenticated identity
+   - DO success body carries `{ "completed_at": <ms> }` (a forward-compat passthrough of `complete_wake`'s returned timestamp); Worker emits §3.3's `{ "completed": true, "wake_id": "..." }`.
+
+   Specific register translations:
+   - `context_id` flows through
+   - inject `identity_b64` from URL path (already authenticated against bearer)
+   - `metadata` is deserialized into `PublicRegisterRequest.metadata: Option<serde_json::Value>` so the public contract is honored, but **not forwarded to the DO** in MVP (the internal `RegisterRequest` schema doesn't include metadata storage). Phase 2 wires `agent:{identity_b64}:metadata` storage and the Worker stops dropping the field.
+
+   Specific inbox translations:
+   - per-entry `caller_identity_b64` → `caller_identity`; `payload_b64` → `payload`
+   - internal `WakeSummary.expires_at_ms: u64` (derived in the DO from `wake.created_at + wake.timeout_ms`) → public `PublicWakeSummary.expires_at: String` (ISO-8601 UTC). This is the reason the F.1 expansion adds `expires_at_ms` to the internal `WakeSummary` shape — without it, the Worker would have no source data for the public `expires_at` field that §3.3 specifies.
+
+3. **Internal `DispatchResponse` refinement** (Decision 4's "Second §9.1 mid-implementation correction" — see above). Internal `WakeSummary` similarly gains `expires_at_ms: u64` so the Worker can format ISO-8601 `expires_at`. Both refinements are §9.1 errata: the §9.1 sub-PR's internal shapes lacked the source data needed for §3.3's public response shapes. The F.1 expansion lands them inline.
+
+4. **Error response JSON shape per §3.3 + spec for cases not shown.** Error responses are structured JSON with an `error` string and contextual fields. §3.3 examples specify:
+   - 408 `TimeoutExpired`: `{ "error": "wake timed out", "wake_id": "...", "timeout_seconds": <n> }`
+   - 422 `HandlerNotFound`: `{ "error": "target has no registered handler for context_id", "context_id": "..." }`
+   - 422 `DispatchRefused`: `{ "error": "<reason>" }` (DispatchRefused's `reason` string conveys context)
+   - 410 `AlreadyTerminal`: `{ "error": "wake already in terminal state", "wake_id": "..." }`
+   - 404 `WakeNotFound`: `{ "error": "wake not found", "wake_id": "..." }`
+   - 403 `IdentityMismatch`: `{ "error": "identity does not match wake target" }`
+
+   Other status codes not shown in §3.3 examples (400, 401, 500): default to `{ "error": "..." }` only.
+
+   Implementation: `stoa_error_to_response` and `tally_error_to_response` now take an `ErrorContext<'a>` parameter carrying optional `wake_id` and `context_id` fields. Callers populate the context they have in scope. The mapper drops unset fields from the response body. Worker-layer errors (auth failure, malformed team_id) use `json_error_response(status, error)` for the bare-`error` shape.
+
+**Correction note (F.1 expansion):** the original Phase 0 design notes (pre-F.1) framed the translation as "the Worker layer translates public HTTP requests into the internal DO request shapes" — a one-sentence mechanical claim. During implementation the agent surfaced (stop-and-surface discipline) that "translation" wasn't fully specified: public type shapes weren't enumerated, error response bodies weren't structured per §3.3, and §9.1's internal shapes lacked the source data needed for the public responses. Strategic layer locked the F.1 expansion to make the translation explicit. The methodology lesson (Layer 4 representative-use): "translation happens" doesn't survive scrutiny once the public response shape demands fields the internal shape doesn't carry. Mid-implementation correction lands as part of this PR's commits.
 
 ### Error code mapping
 
@@ -278,13 +378,13 @@ Inherits §9.1's system properties (eviction handling implicit; snapshot consist
 ## Implementation PR scope
 
 Files modified/created:
-- `tally-worker/src/lib.rs`: replace placeholder fetch with full `worker::Router` setup (6 routes); Worker-side auth flow + error mapping
+- `tally-worker/src/lib.rs`: replace placeholder fetch with full `worker::Router` setup (6 routes); Worker-side auth flow + error mapping; **F.1: public/internal translation per route** (Public* deserialization + internal RPC body construction + public response translation); `format_iso8601_utc` helper for unix-ms → ISO-8601 string conversion; `json_error_response` helper for structured-JSON Worker-layer errors
 - `tally-worker/src/error.rs` *(new)*: `TallyError` type + `From<StoaError>` impl
-- `tally-worker/src/durable_object.rs`: add `inbox_waiters` field; subscribe-first wiring in `handle_read_inbox`; signal-side in `dispatch_with_caller`; `complete_wake` return type + error site revisions; remove `?identity=` parsing; `validate_api_key` handler updated to new shape; `stoa_error_to_response` §3.1 corrections; new `tally_error_to_response`
-- `tally-worker/src/rpc.rs`: `ValidateApiKeyRequest`/`Response` shape change
+- `tally-worker/src/durable_object.rs`: add `inbox_waiters` field; subscribe-first wiring in `handle_read_inbox`; signal-side in `dispatch_with_caller`; `complete_wake` return type + error site revisions; remove `?identity=` parsing; `validate_api_key` handler updated to new shape; `stoa_error_to_response` §3.1 corrections; new `tally_error_to_response`; **F.1: structured-JSON error bodies with `ErrorContext` parameter**; **F.1: dispatch_with_caller returns `(Option<WakeId>, Result<(WakeResponse, u64), StoaError>)`**; **F.1: complete_wake returns `Result<u64, TallyError>`** (the `Ok` arm carries `completed_at`); **F.1: oneshot resolver channel type becomes `Result<(WakeResponse, u64), StoaError>`**; **F.1: WakeSummary materialization computes `expires_at_ms = wake.created_at + wake.timeout_ms`**
+- `tally-worker/src/rpc.rs`: `ValidateApiKeyRequest`/`Response` shape change; **F.1: Public* types** (`PublicDispatchRequest`, `PublicCompleteRequest`, `PublicRegisterRequest`, `PublicDispatchResponse`, `PublicReadInboxResponse`, `PublicWakeSummary`, `PublicRegisterResponse`, `PublicCompleteResponse`); **F.1: internal `DispatchResponse` gains `wake_id: WakeId` and `completed_at: u64`** (§9.1 mid-implementation correction); **F.1: internal `WakeSummary` gains `expires_at_ms: u64`**
 - `tally-worker/src/dispatch_consts.rs`: add wait/limit constants + compile-time invariants
 
-Estimated diff: ~800-1200 lines substantive code; ~150-250 lines unit tests (worker-layer auth happy/failure paths; inbox_waiters subscribe/signal/timeout; pagination; TallyError mapping).
+Estimated diff: ~1000-1400 lines substantive code (F.1 expansion added ~200-400 lines for Public* types + Worker-side translation + ISO-8601 helper + structured-JSON error mapper); ~200-300 lines unit tests (worker-layer auth happy/failure paths; inbox_waiters subscribe/signal/timeout; pagination; TallyError mapping; F.1: Public* round-trip serde tests; ISO-8601 formatting boundary tests).
 
 ## Open questions for future sub-PRs
 

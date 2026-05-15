@@ -18,6 +18,14 @@ new_classes = ["TallyTeamDO"]
 # worker-build must run from the tally-worker package directory; the
 # workspace root's Cargo.toml has no [package] section, which
 # worker-build rejects with "missing field `package`".
-# Pin worker-build to 0.1.14 (compatible with worker = "0.5"); newer
-# worker-build versions require worker >= 0.8.3.
-command = "cargo install -q worker-build --version '0.1.14' && cd tally-worker && worker-build --release"
+#
+# Known toolchain compat issue: `worker = "0.5"` (the locked tally-worker
+# dep version) doesn't compose cleanly with current worker-build /
+# wasm-bindgen-cli releases. worker-build 0.8.3 requires worker >= 0.8.3;
+# worker-build 0.1.14 bundles wasm-bindgen-cli 0.2.105 which mismatches
+# tally's transitive wasm-bindgen 0.2.121. A future "upgrade worker-rs"
+# sub-PR will upgrade `worker` to a current release and resolve this;
+# in the meantime, `wrangler dev` invocations against this config are
+# blocked. See docs/specs/integration-tests-sub-pr-test-plan.md
+# § "CI execution status" for the full context.
+command = "cargo install -q worker-build && cd tally-worker && worker-build --release"

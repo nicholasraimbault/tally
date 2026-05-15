@@ -190,9 +190,11 @@ Storage key: `wake:{wake_id_string}` where `{wake_id_string}` is the ULID's Croc
 
 ### 9. dispatch_with_caller flow + tokio safety timeout
 
-**Decision:** dispatch_with_caller is an inherent method on TallyTeamDO with five parameters; it awaits the oneshot Receiver wrapped in `tokio::time::timeout(timeout + SAFETY_BUFFER, receiver)` for belt-and-suspenders safety. The alarm-based timeout is the primary timeout mechanism; the tokio wrapper is the safety net.
+**Decision:** dispatch_with_caller is an inherent method on TallyTeamDO with five parameters; it awaits the oneshot Receiver raced against a `worker::Delay` of `timeout + SAFETY_BUFFER` via `futures::future::select` for belt-and-suspenders safety. The alarm-based timeout is the primary timeout mechanism; the `worker::Delay` race is the safety net.
 
-**Context:** The await on the oneshot Receiver could in principle hang if the Sender is dropped without sending (e.g., DO restart drops in-memory state; implementation bug). The alarm-based timeout fires at `absolute_timeout` and signals the resolver with `Err(StoaError::Wake(WakeError::TimeoutExpired { timeout }))`; this is the canonical timeout path. The `tokio::time::timeout` wrapper bounds the await at `timeout + SAFETY_BUFFER` (5 seconds) as a defensive backstop — the alarm-based path is expected to fire first.
+**Context:** The await on the oneshot Receiver could in principle hang if the Sender is dropped without sending (e.g., DO restart drops in-memory state; implementation bug). The alarm-based timeout fires at `absolute_timeout` and signals the resolver with `Err(StoaError::Wake(WakeError::TimeoutExpired { timeout }))`; this is the canonical timeout path. A `worker::Delay`-based race wraps the await at `timeout + SAFETY_BUFFER` (5 seconds) as a defensive backstop — the alarm-based path is expected to fire first.
+
+**Correction note:** an earlier draft of this design specified `tokio::time::timeout` for the safety wrapper. That API is incompatible with Cloudflare Workers' `wasm32-unknown-unknown` target which has no tokio timer driver — `tokio::time` functions panic at runtime on this target. The substitute `worker::Delay` raced via `futures::future::select` preserves the safety-wrapper semantic with wasm-compatible runtime. Implementation surfaced this during the dispatch sub-PR's stop-and-surface; strategic-layer locked the substitution. The methodology lesson: Layer 4 (representative-use drafting) must verify runtime correctness on the deployment target, not just compile-time correctness.
 
 **Implementation contract:**
 
@@ -210,14 +212,22 @@ pub(crate) async fn dispatch_with_caller(
 Flow per Decision 5 (operation shape). Post-storage await step:
 
 ```rust
+use futures::future::{select, Either};
+
 let total_timeout = timeout + SAFETY_BUFFER;
-match tokio::time::timeout(total_timeout, receiver).await {
-    Ok(Ok(Ok(response))) => Ok(response),                          // wake completed normally
-    Ok(Ok(Err(e))) => Err(e),                                       // alarm-fire's TimeoutExpired, etc.
-    Ok(Err(_recv_error)) => Err(StoaError::Wake(WakeError::Other(
-        "resolver dropped without resolution (DO restart or bug)".to_string()
-    ))),
-    Err(_elapsed) => Err(StoaError::Wake(WakeError::TimeoutExpired { timeout })),
+let delay = worker::Delay::from(total_timeout);
+
+match select(receiver, delay).await {
+    Either::Left((result, _delay)) => match result {
+        Ok(Ok(response)) => Ok(response),                           // wake completed normally
+        Ok(Err(e)) => Err(e),                                        // alarm-fire's TimeoutExpired, etc.
+        Err(_recv_error) => Err(StoaError::Wake(WakeError::Other(
+            "resolver dropped without resolution (DO restart or bug)".to_string()
+        ))),
+    },
+    Either::Right(((), _receiver)) => Err(StoaError::Wake(
+        WakeError::TimeoutExpired { timeout }
+    )),
 }
 ```
 
@@ -373,7 +383,8 @@ Properties of the implemented system, documented for operational awareness:
 - `serde_bytes` — binary serialization for WakeRecord.payload and response_payload (Decision 8)
 - `ulid` — WakeId generation; wasm32-compatible via web-time crate (Decision 3)
 - `base64` — HTTP transport b64 encoding/decoding (handlers); may already be transitive
-- `tokio` feature `time` addition (Decision 9 safety wrapper); `sync` already present
+- `tokio` features `sync` (oneshot::channel). The `time` feature is intentionally excluded: `tokio::time::timeout` panics at runtime on `wasm32-unknown-unknown` (no timer driver). See Decision 9 correction note.
+- `futures` — `future::select` + `Either` to race the oneshot Receiver against `worker::Delay` (Decision 9 safety wrapper)
 
 **Constants** (placement: `tally-worker/src/dispatch_consts.rs`):
 
@@ -397,7 +408,7 @@ pub const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 /// Per-target inbox cap per Phase 0 §3.2. Overflow evicts the head (FIFO oldest).
 pub const INBOX_LIMIT: usize = 1_000;
 
-/// Safety buffer on dispatch's tokio::time::timeout wrapper (Decision 9).
+/// Safety buffer on dispatch's worker::Delay safety wrapper (Decision 9).
 pub const SAFETY_BUFFER: Duration = Duration::from_secs(5);
 ```
 

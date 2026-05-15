@@ -56,11 +56,17 @@ base64 = "0.22"
 # dispatch site).
 anyhow = "1"
 
-# Phase 2 deps (ed25519-dalek + rand_core for keypair generation;
-# serde + serde_json for HTTP request/response DTOs) are added in the
-# next commit when command implementations need them. Splitting keeps
-# cargo-machete clean at this commit boundary per the discipline
-# established by PR #20's humantime removal.
+# Wire-format types for request/response bodies. DTOs are defined
+# inline per CLI command module (D11) — they mirror tally-worker's
+# Public* types without importing them (tally-worker is wasm32-only).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Ed25519 keypair generation for the operator identity (`tally init`).
+# rand_core 0.6 is the version ed25519-dalek 2.x consumes; OsRng
+# provides the cryptographically-secure source.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [lints.rust]
 unsafe_code = "forbid"

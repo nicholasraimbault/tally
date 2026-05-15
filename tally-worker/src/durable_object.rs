@@ -1,34 +1,78 @@
-//! `TallyTeamDO` Durable Object — state model per Phase 0 §4.
+//! `TallyTeamDO` Durable Object — state model per Phase 0 §4 + dispatch
+//! sub-PR Phase 0.
 //!
-//! Per Phase 0 §2.2, `TallyTeamDO` holds only `state: State` — Cloudflare's
-//! single-writer guarantee makes additional locking unnecessary. Future
-//! addition during the dispatch sub-PR: `wake_resolvers` HashMap for
-//! in-memory promise resolution.
+//! Per Phase 0 §2.2 the DO holds `state: State` (Cloudflare's single-writer
+//! guarantee makes additional locking unnecessary). The dispatch sub-PR
+//! adds the `wake_resolvers` in-memory map (Decision 7) that bridges
+//! between the dispatch await path (oneshot Receiver) and the resolution
+//! paths (`complete_wake` / alarm-fire).
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::result::Result as StdResult;
+use std::str::FromStr;
+use std::time::Duration;
 
 use worker::*;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use js_sys::{Object, Reflect};
+use tokio::sync::oneshot;
+use wasm_bindgen::JsValue;
+
 use stoa::types::Identity;
-use stoa::wake_router::WakeRouter;
+use stoa::wake_router::{WakePayload, WakeResponse, WakeRouter};
 use stoa::{StoaError, WakeError};
 use tally_core::TeamMeta;
 
-use crate::rpc::{
-    OkResponse, ReadInboxQuery, ReadInboxResponse, RegisterRequest, UnregisterRequest,
-    ValidateApiKeyRequest, ValidateApiKeyResponse,
+use crate::dispatch_consts::{
+    INBOX_LIMIT, MAX_PAYLOAD_BYTES, MAX_RESPONSE_BYTES, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
+    SAFETY_BUFFER,
 };
+use crate::rpc::{
+    CompleteRequest, DispatchRequest, DispatchResponse, OkResponse, ReadInboxQuery,
+    ReadInboxResponse, RegisterRequest, UnregisterRequest, ValidateApiKeyRequest,
+    ValidateApiKeyResponse, WakeSummary,
+};
+use crate::wake_types::{WakeId, WakeRecord, WakeState};
 
 const TENANCY_PREFIX_MVP: &str = "tally-cli-local";
 const TEAM_META_KEY: &str = "team:meta";
 
+/// Storage key for the alarm queue — `BTreeMap<u64, Vec<WakeId>>` keyed
+/// by absolute timeout (unix millis).
+const ALARM_QUEUE_KEY: &str = "alarm_queue";
+
+/// Build the per-target inbox storage key.
+fn inbox_key(identity_b64: &str) -> String {
+    format!("agent:{}:inbox", identity_b64)
+}
+
+/// Build the per-wake row storage key.
+fn wake_key(wake_id: &WakeId) -> String {
+    format!("wake:{}", wake_id)
+}
+
 #[durable_object]
 pub struct TallyTeamDO {
     pub(crate) state: State,
+    /// In-memory map from wake_id to the awaiter's oneshot `Sender`.
+    ///
+    /// Per Phase 0 Decision 7 + Lock 4.6.1. Populated post-storage in
+    /// [`TallyTeamDO::dispatch_with_caller`]; drained post-storage in
+    /// [`TallyTeamDO::complete_wake`] and in the alarm-fire handler.
+    /// Cloudflare DO eviction drops this; storage persists, alarm fires
+    /// after rehydration, pending wakes route to TimedOut.
+    pub(crate) wake_resolvers: HashMap<WakeId, oneshot::Sender<StdResult<WakeResponse, StoaError>>>,
 }
 
 #[durable_object]
 impl DurableObject for TallyTeamDO {
     fn new(state: State, _env: Env) -> Self {
-        Self { state }
+        Self {
+            state,
+            wake_resolvers: HashMap::new(),
+        }
     }
 
     async fn fetch(&mut self, mut req: Request) -> Result<Response> {
@@ -43,12 +87,160 @@ impl DurableObject for TallyTeamDO {
             (Method::Post, "/unregister") => self.handle_unregister(&mut req).await,
             (Method::Post, "/dispatch") => self.handle_dispatch(&mut req).await,
             (Method::Get, p) if p.starts_with("/inbox") => self.handle_read_inbox(&req).await,
-            (Method::Post, "/complete") => {
-                Response::error("complete_wake deferred to dispatch sub-PR", 501)
-            }
+            (Method::Post, "/complete") => self.handle_complete_wake(&mut req).await,
             (Method::Post, "/validate_api_key") => self.handle_validate_api_key(&mut req).await,
             _ => Response::error("not found", 404),
         }
+    }
+
+    /// Alarm-fire handler — Pending→TimedOut transitions for all due wakes.
+    ///
+    /// Per Phase 0 Decision 5 (operation shape) + Decision 6 (β.1 transition
+    /// bundles target inbox writes). Reads alarm_queue; for each due wake_id,
+    /// reads its wake row, defensively skipping on missing rows (Lock 2.6.8).
+    /// Builds atomic `put_multiple_raw` with N transitioned wake rows + M
+    /// distinct-target inboxes + updated alarm_queue, then resolves the
+    /// in-memory resolvers with `TimeoutExpired` and reschedules the alarm
+    /// to the next-earliest entry (or deletes the alarm if the queue is
+    /// empty).
+    async fn alarm(&mut self) -> Result<Response> {
+        let now_ms = Date::now().as_millis();
+
+        let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
+            .state
+            .storage()
+            .get(ALARM_QUEUE_KEY)
+            .await
+            .unwrap_or_default();
+
+        // Partition: due entries (≤ now) vs future entries (> now).
+        let due_keys: Vec<u64> = alarm_queue.range(..=now_ms).map(|(k, _)| *k).collect();
+
+        if due_keys.is_empty() {
+            // Spurious fire (or already-handled): reschedule to the new
+            // earliest, or delete the alarm if queue is empty.
+            self.reschedule_alarm(&alarm_queue).await?;
+            return Response::ok("no due wakes");
+        }
+
+        // Collect due (wake_id, absolute_timeout) pairs and remove them
+        // from alarm_queue.
+        let mut due_pairs: Vec<(WakeId, u64)> = Vec::new();
+        for k in &due_keys {
+            if let Some(ids) = alarm_queue.remove(k) {
+                for id in ids {
+                    due_pairs.push((id, *k));
+                }
+            }
+        }
+
+        // Sequential reads: read each due wake row. Defensive skip on
+        // missing rows (Lock 2.6.8).
+        struct DueWake {
+            wake_id: WakeId,
+            record: WakeRecord,
+            timeout_ms: u32,
+        }
+        let mut transitions: Vec<DueWake> = Vec::with_capacity(due_pairs.len());
+        for (wake_id, _abs_ms) in &due_pairs {
+            let key = wake_key(wake_id);
+            match self.state.storage().get::<WakeRecord>(&key).await {
+                Ok(record) if matches!(record.state, WakeState::Pending) => {
+                    let timeout_ms = record.timeout_ms;
+                    transitions.push(DueWake {
+                        wake_id: *wake_id,
+                        record,
+                        timeout_ms,
+                    });
+                }
+                Ok(_) => {
+                    // Already terminal (e.g., complete_wake transitioned
+                    // it before this alarm fired). Skip; the inbox entry
+                    // was removed at transition time per Decision 6.
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        wake_id = %wake_id,
+                        "alarm-fire references missing wake row (defensive skip per Lock 2.6.8)"
+                    );
+                }
+            }
+        }
+
+        // Group inbox updates by target identity (M distinct targets).
+        // Each target's inbox is read once and updated to remove all
+        // transitioning wake_ids targeting it.
+        let mut inbox_updates: HashMap<String, VecDeque<WakeId>> = HashMap::new();
+        for dw in &transitions {
+            let target_b64 = dw.record.target_identity.clone();
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                inbox_updates.entry(target_b64.clone())
+            {
+                let key = inbox_key(&target_b64);
+                let inbox: VecDeque<WakeId> =
+                    self.state.storage().get(&key).await.unwrap_or_default();
+                e.insert(inbox);
+            }
+        }
+        for dw in &transitions {
+            if let Some(inbox) = inbox_updates.get_mut(&dw.record.target_identity) {
+                inbox.retain(|id| *id != dw.wake_id);
+            }
+        }
+
+        // Compute transitioned wake rows (Pending → TimedOut).
+        let transitioned_records: Vec<(WakeId, WakeRecord)> = transitions
+            .iter()
+            .map(|dw| {
+                let mut rec = dw.record.clone();
+                rec.state = WakeState::TimedOut;
+                (dw.wake_id, rec)
+            })
+            .collect();
+
+        // Compose put_multiple_raw object: N transitioned wake rows + M
+        // target inboxes + alarm_queue = N+1+M keys (Decision 6).
+        let writes = Object::new();
+        for (id, rec) in &transitioned_records {
+            let jsv = serde_wasm_bindgen::to_value(rec).map_err(|e| {
+                Error::RustError(format!("alarm: serialize wake record {}: {}", id, e))
+            })?;
+            Reflect::set(&writes, &JsValue::from_str(&wake_key(id)), &jsv)
+                .map_err(|_| Error::RustError(format!("alarm: Reflect::set wake key {}", id)))?;
+        }
+        for (target_b64, inbox) in &inbox_updates {
+            let jsv = serde_wasm_bindgen::to_value(inbox).map_err(|e| {
+                Error::RustError(format!("alarm: serialize inbox for {}: {}", target_b64, e))
+            })?;
+            Reflect::set(&writes, &JsValue::from_str(&inbox_key(target_b64)), &jsv).map_err(
+                |_| Error::RustError(format!("alarm: Reflect::set inbox {}", target_b64)),
+            )?;
+        }
+        let aq_jsv = serde_wasm_bindgen::to_value(&alarm_queue)
+            .map_err(|e| Error::RustError(format!("alarm: serialize alarm_queue: {}", e)))?;
+        Reflect::set(&writes, &JsValue::from_str(ALARM_QUEUE_KEY), &aq_jsv)
+            .map_err(|_| Error::RustError("alarm: Reflect::set alarm_queue".to_string()))?;
+
+        self.state
+            .storage()
+            .put_multiple_raw(writes)
+            .await
+            .map_err(|e| Error::RustError(format!("alarm: put_multiple_raw failed: {}", e)))?;
+
+        // Post-storage: resolve in-memory resolvers (best-effort per
+        // Lock 4.6.3 — Sender::send Err if Receiver dropped is no-op).
+        for dw in &transitions {
+            if let Some(sender) = self.wake_resolvers.remove(&dw.wake_id) {
+                let _ = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
+                    timeout: Duration::from_millis(dw.timeout_ms as u64),
+                })));
+            }
+        }
+
+        // Reschedule alarm to the next-earliest entry (or delete it).
+        self.reschedule_alarm(&alarm_queue).await?;
+
+        Response::ok("alarm processed")
     }
 }
 
@@ -104,8 +296,516 @@ impl TallyTeamDO {
         }
     }
 
-    async fn handle_dispatch(&mut self, _req: &mut Request) -> Result<Response> {
-        Response::error("dispatch deferred to dispatch sub-PR", 501)
+    /// HTTP dispatch handler per Phase 0 Decision 9 + Lock 6.6.1.
+    ///
+    /// Wire-format per dispatch sub-PR Phase 0 §1 (`DispatchRequest`).
+    /// Flow: deserialize → validate (caller, target, payload, timeout) →
+    /// [`Self::dispatch_with_caller`] → map result to
+    /// [`DispatchResponse`] (HTTP 200) or error via
+    /// [`stoa_error_to_response`].
+    async fn handle_dispatch(&mut self, req: &mut Request) -> Result<Response> {
+        let body: DispatchRequest = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("invalid request body: {}", e), 400),
+        };
+
+        // Validate identities.
+        let caller = match Identity::from_url_safe_b64(&body.caller_identity_b64) {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::error(format!("invalid caller_identity_b64: {}", e), 400);
+            }
+        };
+        let target = match Identity::from_url_safe_b64(&body.target_identity_b64) {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::error(format!("invalid target_identity_b64: {}", e), 400);
+            }
+        };
+
+        // Validate context_id.
+        if body.context_id.is_empty() {
+            return Ok(stoa_error_to_response(&StoaError::Wake(
+                WakeError::DispatchRefused {
+                    reason: "context_id must be non-empty".to_string(),
+                },
+            )));
+        }
+
+        // Validate payload.
+        let payload_bytes = match BASE64_URL_SAFE_NO_PAD.decode(body.payload_b64.as_bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                return Ok(stoa_error_to_response(&StoaError::Wake(
+                    WakeError::DispatchRefused {
+                        reason: format!("invalid payload_b64: {}", e),
+                    },
+                )));
+            }
+        };
+        if payload_bytes.len() > MAX_PAYLOAD_BYTES {
+            return Ok(stoa_error_to_response(&StoaError::Wake(
+                WakeError::DispatchRefused {
+                    reason: format!(
+                        "payload {} bytes exceeds MAX_PAYLOAD_BYTES ({})",
+                        payload_bytes.len(),
+                        MAX_PAYLOAD_BYTES
+                    ),
+                },
+            )));
+        }
+
+        // Validate timeout. Zero / out-of-range → InvalidTimeout (504/400
+        // path via stoa_error_to_response).
+        if body.timeout_ms < MIN_TIMEOUT_MS || body.timeout_ms > MAX_TIMEOUT_MS {
+            return Ok(stoa_error_to_response(&StoaError::Wake(
+                WakeError::InvalidTimeout,
+            )));
+        }
+        let timeout = Duration::from_millis(body.timeout_ms as u64);
+
+        // Delegate to the inherent method.
+        match self
+            .dispatch_with_caller(
+                &target,
+                &caller,
+                body.context_id.as_bytes(),
+                WakePayload(payload_bytes),
+                timeout,
+            )
+            .await
+        {
+            Ok(response) => {
+                let resp = DispatchResponse {
+                    responding_identity_b64: body.target_identity_b64,
+                    response_payload_b64: BASE64_URL_SAFE_NO_PAD.encode(&response.0),
+                };
+                Response::from_json(&resp)
+            }
+            Err(e) => Ok(stoa_error_to_response(&e)),
+        }
+    }
+
+    /// Dispatch a wake — persistence-aware inherent method per Phase 0
+    /// Decision 9 + Lock 6.6.3.
+    ///
+    /// The trait method [`WakeRouter::dispatch`] has no caller param;
+    /// `WakeRecord` storage requires one (Decision 8). This inherent
+    /// method is the operational implementation surface.
+    ///
+    /// Flow per Decision 5 (operation shape):
+    /// 1. Pre-checks (in-memory): validate timeout, payload size,
+    ///    context UTF-8.
+    /// 2. Sequential reads: target inbox; alarm_queue.
+    /// 3. Compute new state in locals: new `WakeRecord` (Pending),
+    ///    updated inbox (pushed + overflow-evicted if at INBOX_LIMIT),
+    ///    updated alarm_queue (new entry at `absolute_timeout`;
+    ///    overflow entry removed if any).
+    /// 4. Atomic delete of overflow wake row (α.2 ordering;
+    ///    overflow-only case).
+    /// 5. Atomic multi-key `put_multiple_raw`: new wake row + updated
+    ///    inbox + updated alarm_queue (3 keys).
+    /// 6. Post-storage: insert resolver in `wake_resolvers`; call
+    ///    `set_alarm` with the new earliest absolute_timeout (or
+    ///    `delete_alarm` if alarm_queue ends up empty — shouldn't
+    ///    happen here since we just added our entry).
+    ///
+    /// Awaits the oneshot Receiver wrapped in
+    /// `tokio::time::timeout(timeout + SAFETY_BUFFER, receiver)` as a
+    /// belt-and-suspenders safety net. The alarm-based timeout is the
+    /// canonical path; the tokio wrapper is the defensive backstop.
+    pub(crate) async fn dispatch_with_caller(
+        &mut self,
+        target: &Identity,
+        caller: &Identity,
+        context: &[u8],
+        payload: WakePayload,
+        timeout: Duration,
+    ) -> StdResult<WakeResponse, StoaError> {
+        // ── 1. Pre-checks ─────────────────────────────────────────────
+        let context_str = std::str::from_utf8(context).map_err(|_| {
+            StoaError::Wake(WakeError::DispatchRefused {
+                reason: "context must be valid UTF-8".to_string(),
+            })
+        })?;
+        if context_str.is_empty() {
+            return Err(StoaError::Wake(WakeError::DispatchRefused {
+                reason: "context_id must be non-empty".to_string(),
+            }));
+        }
+        if payload.0.len() > MAX_PAYLOAD_BYTES {
+            return Err(StoaError::Wake(WakeError::DispatchRefused {
+                reason: format!(
+                    "payload {} bytes exceeds MAX_PAYLOAD_BYTES ({})",
+                    payload.0.len(),
+                    MAX_PAYLOAD_BYTES
+                ),
+            }));
+        }
+        let timeout_ms_u128 = timeout.as_millis();
+        if timeout_ms_u128 < MIN_TIMEOUT_MS as u128 || timeout_ms_u128 > MAX_TIMEOUT_MS as u128 {
+            return Err(StoaError::Wake(WakeError::InvalidTimeout));
+        }
+        let timeout_ms = timeout_ms_u128 as u32;
+
+        let target_b64 = target.to_url_safe_b64();
+        let caller_b64 = caller.to_url_safe_b64();
+
+        // ── 2. Sequential reads ───────────────────────────────────────
+        let mut inbox: VecDeque<WakeId> = self
+            .state
+            .storage()
+            .get(&inbox_key(&target_b64))
+            .await
+            .unwrap_or_default();
+
+        let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
+            .state
+            .storage()
+            .get(ALARM_QUEUE_KEY)
+            .await
+            .unwrap_or_default();
+
+        // ── 3. Compute new state in locals ────────────────────────────
+        let wake_id = WakeId::new();
+        let created_at = Date::now().as_millis();
+        let absolute_timeout = created_at + timeout_ms as u64;
+
+        let new_record = WakeRecord {
+            wake_id,
+            target_identity: target_b64.clone(),
+            caller_identity: caller_b64,
+            context_id: context_str.to_string(),
+            payload: payload.0,
+            state: WakeState::Pending,
+            created_at,
+            timeout_ms,
+            response_payload: None,
+        };
+
+        // Push new wake_id to inbox tail; if over INBOX_LIMIT, evict head.
+        inbox.push_back(wake_id);
+        let mut overflow_wake_id: Option<WakeId> = None;
+        if inbox.len() > INBOX_LIMIT {
+            overflow_wake_id = inbox.pop_front();
+        }
+
+        // alarm_queue insert: new wake.
+        alarm_queue
+            .entry(absolute_timeout)
+            .or_default()
+            .push(wake_id);
+
+        // alarm_queue cleanup for overflow_wake_id: scan-based lookup
+        // per Lock 2.6.1 ("Dispatch's overflow uses alarm_queue scan").
+        // No overflow wake row read.
+        if let Some(ovid) = overflow_wake_id {
+            let mut found_at: Option<u64> = None;
+            'scan: for (k, ids) in alarm_queue.iter() {
+                for id in ids {
+                    if *id == ovid {
+                        found_at = Some(*k);
+                        break 'scan;
+                    }
+                }
+            }
+            match found_at {
+                Some(k) => {
+                    if let Some(ids) = alarm_queue.get_mut(&k) {
+                        ids.retain(|id| *id != ovid);
+                    }
+                    if alarm_queue.get(&k).map(|v| v.is_empty()).unwrap_or(false) {
+                        alarm_queue.remove(&k);
+                    }
+                }
+                None => {
+                    // Invariant-violation defense (Lock 2.6.1): inbox
+                    // held a wake_id whose alarm_queue entry was already
+                    // gone. Log + proceed with skipped cleanup.
+                    tracing::warn!(
+                        wake_id = %ovid,
+                        "dispatch overflow: alarm_queue scan-not-found for evicted wake_id \
+                         (invariant violation; proceeding with skipped cleanup per Lock 2.6.1)"
+                    );
+                }
+            }
+        }
+
+        // ── 4. Atomic delete (overflow case only — α.2 ordering) ──────
+        if let Some(ovid) = overflow_wake_id {
+            if let Err(e) = self.state.storage().delete(&wake_key(&ovid)).await {
+                return Err(StoaError::Wake(WakeError::Other(format!(
+                    "dispatch overflow delete failed: {}",
+                    e
+                ))));
+            }
+        }
+
+        // ── 5. Atomic multi-key put_multiple_raw ──────────────────────
+        let writes = Object::new();
+        let record_jsv = serde_wasm_bindgen::to_value(&new_record).map_err(|e| {
+            StoaError::Wake(WakeError::Other(format!("serialize wake record: {}", e)))
+        })?;
+        Reflect::set(
+            &writes,
+            &JsValue::from_str(&wake_key(&wake_id)),
+            &record_jsv,
+        )
+        .map_err(|_| StoaError::Wake(WakeError::Other("Reflect::set wake key".to_string())))?;
+        let inbox_jsv = serde_wasm_bindgen::to_value(&inbox)
+            .map_err(|e| StoaError::Wake(WakeError::Other(format!("serialize inbox: {}", e))))?;
+        Reflect::set(
+            &writes,
+            &JsValue::from_str(&inbox_key(&target_b64)),
+            &inbox_jsv,
+        )
+        .map_err(|_| StoaError::Wake(WakeError::Other("Reflect::set inbox key".to_string())))?;
+        let aq_jsv = serde_wasm_bindgen::to_value(&alarm_queue).map_err(|e| {
+            StoaError::Wake(WakeError::Other(format!("serialize alarm_queue: {}", e)))
+        })?;
+        Reflect::set(&writes, &JsValue::from_str(ALARM_QUEUE_KEY), &aq_jsv).map_err(|_| {
+            StoaError::Wake(WakeError::Other("Reflect::set alarm_queue key".to_string()))
+        })?;
+        self.state
+            .storage()
+            .put_multiple_raw(writes)
+            .await
+            .map_err(|e| StoaError::Wake(WakeError::Other(format!("put_multiple_raw: {}", e))))?;
+
+        // ── 6. Post-storage in-memory mutation + alarm scheduling ─────
+        let (sender, receiver) = oneshot::channel::<StdResult<WakeResponse, StoaError>>();
+        self.wake_resolvers.insert(wake_id, sender);
+
+        // Reschedule alarm to the new earliest entry. The queue is
+        // non-empty (just added our entry); but reschedule_alarm
+        // tolerates both cases.
+        if let Err(e) = self.reschedule_alarm(&alarm_queue).await {
+            // Storage already committed; alarm scheduling failure leaves
+            // the dispatch in a half-state where the wake row exists but
+            // no alarm is set. Best-effort recovery: drop the resolver,
+            // surface the error.
+            self.wake_resolvers.remove(&wake_id);
+            return Err(StoaError::Wake(WakeError::Other(format!(
+                "set_alarm failed post-storage: {}",
+                e
+            ))));
+        }
+
+        // Inbox-waiter signal (Decision 7 operational notes; signal-only
+        // option c). Full subscription mechanism is §9.2 scope; the
+        // signal site lives here to document the seam.
+        // (No-op in this sub-PR.)
+
+        // ── Await resolution with safety timeout ──────────────────────
+        let total_timeout = timeout + SAFETY_BUFFER;
+        match tokio::time::timeout(total_timeout, receiver).await {
+            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_recv_error)) => Err(StoaError::Wake(WakeError::Other(
+                "resolver dropped without resolution (DO restart or bug)".to_string(),
+            ))),
+            Err(_elapsed) => Err(StoaError::Wake(WakeError::TimeoutExpired { timeout })),
+        }
+    }
+
+    /// HTTP complete handler per Phase 0 Lock 6.6.2.
+    ///
+    /// Wire-format per dispatch sub-PR Phase 0 §2 (`CompleteRequest`).
+    async fn handle_complete_wake(&mut self, req: &mut Request) -> Result<Response> {
+        let body: CompleteRequest = match req.json().await {
+            Ok(b) => b,
+            Err(e) => return Response::error(format!("invalid request body: {}", e), 400),
+        };
+
+        let by_identity = match Identity::from_url_safe_b64(&body.by_identity_b64) {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::error(format!("invalid by_identity_b64: {}", e), 400);
+            }
+        };
+
+        let wake_id = match WakeId::from_str(&body.wake_id) {
+            Ok(id) => id,
+            Err(e) => {
+                return Response::error(format!("invalid wake_id: {}", e), 400);
+            }
+        };
+
+        let response_payload =
+            match BASE64_URL_SAFE_NO_PAD.decode(body.response_payload_b64.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Response::error(format!("invalid response_payload_b64: {}", e), 400);
+                }
+            };
+        if response_payload.len() > MAX_RESPONSE_BYTES {
+            return Ok(stoa_error_to_response(&StoaError::Wake(
+                WakeError::DispatchRefused {
+                    reason: format!(
+                        "response {} bytes exceeds MAX_RESPONSE_BYTES ({})",
+                        response_payload.len(),
+                        MAX_RESPONSE_BYTES
+                    ),
+                },
+            )));
+        }
+
+        match self
+            .complete_wake(&wake_id, &by_identity, response_payload)
+            .await
+        {
+            Ok(()) => Response::from_json(&OkResponse),
+            Err(e) => Ok(stoa_error_to_response(&e)),
+        }
+    }
+
+    /// Complete a pending wake — Pending → Completed transition per
+    /// Phase 0 Lock 6.6.4 (β.1).
+    ///
+    /// Flow per Decision 5 (operation shape):
+    /// 1. Pre-checks: deserialize-time identity/wake_id validation done
+    ///    in the HTTP handler.
+    /// 2. Sequential reads: wake row → alarm_queue → target inbox (the
+    ///    target identity comes from the wake row, so inbox read must
+    ///    follow wake row read).
+    /// 3. State guard: wake must be `Pending`; otherwise refuse (caller
+    ///    is racing a timeout fire or replaying).
+    /// 4. Identity guard: `by_identity` must equal `wake.target_identity`
+    ///    (MVP — only the target completes its own wake; future
+    ///    delegation semantics could relax).
+    /// 5. Compute new state in locals: transitioned wake row (Pending →
+    ///    Completed; response_payload populated); updated alarm_queue
+    ///    (entry at `wake.created_at + wake.timeout_ms` removed; the
+    ///    absolute_timeout is direct-computed since the row is in hand
+    ///    per Lock 6.6.4); updated target inbox (wake_id removed per
+    ///    Decision 6 transition contract).
+    /// 6. Atomic `put_multiple_raw`: 3 keys (transitioned wake row +
+    ///    target inbox + alarm_queue).
+    /// 7. Post-storage: resolve the in-memory resolver if present
+    ///    (best-effort); call `set_alarm` or `delete_alarm` for the new
+    ///    alarm_queue state.
+    pub(crate) async fn complete_wake(
+        &mut self,
+        wake_id: &WakeId,
+        by_identity: &Identity,
+        response_payload: Vec<u8>,
+    ) -> StdResult<(), StoaError> {
+        // ── 2. Sequential reads ───────────────────────────────────────
+        let wake = match self
+            .state
+            .storage()
+            .get::<WakeRecord>(&wake_key(wake_id))
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return Err(StoaError::Wake(WakeError::HandlerNotFound)),
+        };
+
+        // ── 3. State guard ────────────────────────────────────────────
+        if !matches!(wake.state, WakeState::Pending) {
+            return Err(StoaError::Wake(WakeError::DispatchRefused {
+                reason: format!(
+                    "wake is not Pending (current state: {:?}); cannot complete",
+                    wake.state
+                ),
+            }));
+        }
+
+        // ── 4. Identity guard ─────────────────────────────────────────
+        let by_b64 = by_identity.to_url_safe_b64();
+        if by_b64 != wake.target_identity {
+            return Err(StoaError::Wake(WakeError::DispatchRefused {
+                reason: "by_identity does not match wake.target_identity".to_string(),
+            }));
+        }
+
+        // Continue sequential reads: alarm_queue, target inbox.
+        let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
+            .state
+            .storage()
+            .get(ALARM_QUEUE_KEY)
+            .await
+            .unwrap_or_default();
+
+        let mut inbox: VecDeque<WakeId> = self
+            .state
+            .storage()
+            .get(&inbox_key(&wake.target_identity))
+            .await
+            .unwrap_or_default();
+
+        // ── 5. Compute new state in locals ────────────────────────────
+        let absolute_timeout = wake.created_at + wake.timeout_ms as u64;
+        if let Some(ids) = alarm_queue.get_mut(&absolute_timeout) {
+            ids.retain(|id| id != wake_id);
+        }
+        if alarm_queue
+            .get(&absolute_timeout)
+            .map(|v| v.is_empty())
+            .unwrap_or(false)
+        {
+            alarm_queue.remove(&absolute_timeout);
+        }
+
+        inbox.retain(|id| id != wake_id);
+
+        let mut new_record = wake.clone();
+        new_record.state = WakeState::Completed;
+        new_record.response_payload = Some(response_payload.clone());
+
+        // ── 6. Atomic put_multiple_raw (3 keys per Decision 6) ────────
+        let writes = Object::new();
+        let record_jsv = serde_wasm_bindgen::to_value(&new_record).map_err(|e| {
+            StoaError::Wake(WakeError::Other(format!("serialize wake record: {}", e)))
+        })?;
+        Reflect::set(&writes, &JsValue::from_str(&wake_key(wake_id)), &record_jsv)
+            .map_err(|_| StoaError::Wake(WakeError::Other("Reflect::set wake key".to_string())))?;
+        let inbox_jsv = serde_wasm_bindgen::to_value(&inbox)
+            .map_err(|e| StoaError::Wake(WakeError::Other(format!("serialize inbox: {}", e))))?;
+        Reflect::set(
+            &writes,
+            &JsValue::from_str(&inbox_key(&wake.target_identity)),
+            &inbox_jsv,
+        )
+        .map_err(|_| StoaError::Wake(WakeError::Other("Reflect::set inbox key".to_string())))?;
+        let aq_jsv = serde_wasm_bindgen::to_value(&alarm_queue).map_err(|e| {
+            StoaError::Wake(WakeError::Other(format!("serialize alarm_queue: {}", e)))
+        })?;
+        Reflect::set(&writes, &JsValue::from_str(ALARM_QUEUE_KEY), &aq_jsv).map_err(|_| {
+            StoaError::Wake(WakeError::Other("Reflect::set alarm_queue key".to_string()))
+        })?;
+        self.state
+            .storage()
+            .put_multiple_raw(writes)
+            .await
+            .map_err(|e| StoaError::Wake(WakeError::Other(format!("put_multiple_raw: {}", e))))?;
+
+        // ── 7. Post-storage: resolve resolver + reschedule alarm ──────
+        if let Some(sender) = self.wake_resolvers.remove(wake_id) {
+            let _ = sender.send(Ok(WakeResponse(response_payload)));
+        }
+        self.reschedule_alarm(&alarm_queue)
+            .await
+            .map_err(|e| StoaError::Wake(WakeError::Other(format!("reschedule_alarm: {}", e))))?;
+
+        Ok(())
+    }
+
+    /// Set or delete the DO alarm to match the alarm_queue's earliest
+    /// entry. Always reschedules — does not optimize for "only if
+    /// changed" since the tracking complexity exceeds the network-call
+    /// savings (Phase 0 Decision 9 operational notes).
+    async fn reschedule_alarm(&self, alarm_queue: &BTreeMap<u64, Vec<WakeId>>) -> Result<()> {
+        match alarm_queue.keys().next() {
+            Some(earliest_ms) => {
+                // `ScheduledTime: From<i64>` interprets the value as unix
+                // milliseconds. Saturating cast guards against u64 values
+                // exceeding i64::MAX (well outside any realistic clock).
+                let scheduled_ms: i64 = (*earliest_ms).try_into().unwrap_or(i64::MAX);
+                self.state.storage().set_alarm(scheduled_ms).await
+            }
+            None => self.state.storage().delete_alarm().await,
+        }
     }
 
     /// Validate API key — uniform-true in MVP per Phase 0 §4.4.
@@ -121,35 +821,79 @@ impl TallyTeamDO {
         Response::from_json(&ValidateApiKeyResponse { valid: true })
     }
 
-    /// Read inbox — gracefully empty in MVP per Phase 0 §4.5.
+    /// Read inbox immediate-read path per Phase 0 Decision 11 + Lock 6.6.6.
     ///
-    /// Inbox writes happen during dispatch (deferred to a subsequent
-    /// sub-PR), so all reads currently return an empty wakes list. The
-    /// `wait_seconds` parameter is honored via in-memory sleep for
-    /// compatibility with the eventual long-poll behavior; when dispatch
-    /// lands, this handler is updated to actually check for waiting
-    /// wakes during the wait period.
+    /// Parses identity from `?identity=...&wait_seconds=...&limit=...`.
+    /// Reads the inbox; for each wake_id, reads its wake row and
+    /// constructs a [`WakeSummary`]. Missing wake rows are defensively
+    /// skipped with a warn-log per Lock 2.6.9 (α.2 partial-failure orphan).
+    ///
+    /// `wait_seconds` is accepted but ignored in this sub-PR — the
+    /// long-poll trigger (block until `inbox_waiters` signals) is
+    /// §9.2 scope.
     async fn handle_read_inbox(&mut self, req: &Request) -> Result<Response> {
         let url = req.url()?;
-        let mut query = ReadInboxQuery {
+        let mut identity_b64: Option<String> = None;
+        // `wait_seconds` and `limit` are accepted (forward-compat with
+        // §9.2's long-poll surface) but currently ignored. We parse them
+        // into a discarded `ReadInboxQuery` so malformed values surface
+        // no errors in this sub-PR; behaviour ties to §9.2 wire-up.
+        let mut _query = ReadInboxQuery {
             wait_seconds: None,
             limit: None,
         };
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
-                "wait_seconds" => query.wait_seconds = value.parse().ok(),
-                "limit" => query.limit = value.parse().ok(),
+                "identity" => identity_b64 = Some(value.into_owned()),
+                "wait_seconds" => _query.wait_seconds = value.parse().ok(),
+                "limit" => _query.limit = value.parse().ok(),
                 _ => {}
             }
         }
-        let wait_seconds = query.wait_seconds.unwrap_or(0).min(60);
-        let _limit = query.limit.unwrap_or(100).min(1000);
 
-        if wait_seconds > 0 {
-            Delay::from(std::time::Duration::from_secs(wait_seconds as u64)).await;
+        // Validate identity. The Decision 11 contract takes identity from
+        // the query string — convention is the dispatch sub-PR's compromise;
+        // §9.2 may revise.
+        let identity_b64 = match identity_b64 {
+            Some(s) => s,
+            None => return Response::error("missing identity query parameter", 400),
+        };
+        let _identity = match Identity::from_url_safe_b64(&identity_b64) {
+            Ok(id) => id,
+            Err(e) => return Response::error(format!("invalid identity: {}", e), 400),
+        };
+
+        let inbox: VecDeque<WakeId> = self
+            .state
+            .storage()
+            .get(&inbox_key(&identity_b64))
+            .await
+            .unwrap_or_default();
+
+        let mut summaries = Vec::with_capacity(inbox.len());
+        for wid in inbox.iter() {
+            match self.state.storage().get::<WakeRecord>(&wake_key(wid)).await {
+                Ok(wake) => summaries.push(WakeSummary {
+                    wake_id: wid.to_string(),
+                    caller_identity_b64: wake.caller_identity,
+                    context_id: wake.context_id,
+                    payload_b64: BASE64_URL_SAFE_NO_PAD.encode(&wake.payload),
+                }),
+                Err(_) => {
+                    // Defensive skip per Lock 2.6.9: inbox entry
+                    // references a wake row that no longer exists; most
+                    // likely caused by dispatch's overflow-handling α.2
+                    // partial-failure (delete succeeded; put_multiple_raw
+                    // failed). Bounded by α.2 partial-failure rate.
+                    tracing::warn!(
+                        wake_id = %wid,
+                        "inbox references missing wake row (likely α.2 partial-failure orphan)"
+                    );
+                }
+            }
         }
 
-        Response::from_json(&ReadInboxResponse { wakes: vec![] })
+        Response::from_json(&ReadInboxResponse { wakes: summaries })
     }
 }
 

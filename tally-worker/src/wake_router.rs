@@ -1,8 +1,11 @@
 //! `WakeRouter` trait implementation for `TallyTeamDO`.
 //!
-//! Per Phase 0 §3.1-§3.5. The implementation is bounded to
-//! `register_handler` and `unregister_handler` (real work); `dispatch`
-//! is `unimplemented!()` per the scope-boundary stub in §3.3.
+//! Per Phase 0 §3.1-§3.5 (`register_handler`, `unregister_handler`) and
+//! the dispatch sub-PR Phase 0 Decision 10 (`dispatch`). The trait's
+//! `dispatch` method remains `unimplemented!()` because the inherent
+//! method [`crate::durable_object::TallyTeamDO::dispatch_with_caller`]
+//! is the operational implementation — see the doc-comment on
+//! `dispatch` below for the trait-vs-persistence-driven-caller framing.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -36,11 +39,30 @@ impl WakeRouter for TallyTeamDO {
         Ok(())
     }
 
-    /// Dispatch a wake — scope-boundary stub per Phase 0 §3.3.
+    /// Dispatch a wake — C-A-1 loud-failure stub per dispatch sub-PR
+    /// Phase 0 Decision 10.
     ///
-    /// The full implementation lands in the dispatch sub-PR. Calling
-    /// `dispatch` in this PR's deployed state panics; Cloudflare's
-    /// Worker runtime translates the panic to HTTP 500.
+    /// `TallyTeamDO`'s persistence layer (per Decision 8's `WakeRecord`
+    /// schema) requires the caller's identity to record `WakeRecord.caller_identity`.
+    /// `stoa::wake_router::WakeRouter::dispatch`'s trait signature does
+    /// NOT carry a caller param. The impedance is resolved at the
+    /// implementation surface: the inherent method
+    /// [`TallyTeamDO::dispatch_with_caller`] carries the caller and is
+    /// what `handle_dispatch` (the HTTP handler) routes to; the trait
+    /// impl is unreachable in production.
+    ///
+    /// C-A-1 (loud-failure-by-design): calling this trait method
+    /// `unimplemented!()`s. The semantic of "this trait method should
+    /// not be called on this implementation" is better expressed as a
+    /// programming-error panic than a runtime error — calling it
+    /// indicates an architectural mistake in the caller, not a
+    /// runtime failure. Cloudflare's runtime translates the panic to
+    /// HTTP 500.
+    ///
+    /// Forward-compatibility: if `stoa::wake_router::WakeRouter::dispatch`
+    /// grows a caller param in a future protocol revision, this impl
+    /// shifts from `unimplemented!()` to a thin wrapper that forwards
+    /// to [`TallyTeamDO::dispatch_with_caller`].
     async fn dispatch(
         &self,
         _target: &Identity,
@@ -48,7 +70,9 @@ impl WakeRouter for TallyTeamDO {
         _payload: WakePayload,
         _timeout: Duration,
     ) -> Result<WakeResponse, StoaError> {
-        unimplemented!("TallyTeamDO::dispatch lands in the dispatch sub-PR")
+        unimplemented!(
+            "TallyTeamDO::dispatch: use dispatch_with_caller (caller identity required for persistence)"
+        )
     }
 
     /// Unregister eligibility with delete-on-empty per Phase 0 §3.2.

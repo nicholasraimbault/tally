@@ -160,6 +160,12 @@ impl DurableObject for TallyTeamDO {
             .storage()
             .get(ALARM_QUEUE_KEY)
             .await
+            // Storage `get` now returns `Result<Option<T>, _>` (worker 0.7+):
+            // a genuine error → `unwrap_or_default()` collapses to the
+            // empty BTreeMap; a missing row → outer `Some(None)` → likewise.
+            // Either way, an empty alarm_queue is the safe default at this
+            // call site (no due wakes if the queue itself is missing/unreadable).
+            .unwrap_or_default()
             .unwrap_or_default();
 
         // Partition: due entries (≤ now) vs future entries (> now).
@@ -193,8 +199,16 @@ impl DurableObject for TallyTeamDO {
         let mut transitions: Vec<DueWake> = Vec::with_capacity(due_pairs.len());
         for (wake_id, _abs_ms) in &due_pairs {
             let key = wake_key(wake_id);
+            // worker 0.7+ `storage.get` returns `Result<Option<T>, _>`:
+            //   `Ok(Some(record))` — row exists; promote to transition list
+            //     if Pending, otherwise already terminal (skip)
+            //   `Ok(None)` — row missing; defensive-skip per Lock 2.6.8
+            //   `Err(_)` — genuine storage error; defensive-skip with
+            //     warn-log (same outward behavior as the missing-row case,
+            //     since we'd rather process the rest of the due batch than
+            //     fail the whole alarm-fire on one transient read error)
             match self.state.storage().get::<WakeRecord>(&key).await {
-                Ok(record) if matches!(record.state, WakeState::Pending) => {
+                Ok(Some(record)) if matches!(record.state, WakeState::Pending) => {
                     let timeout_ms = record.timeout_ms;
                     transitions.push(DueWake {
                         wake_id: *wake_id,
@@ -202,15 +216,22 @@ impl DurableObject for TallyTeamDO {
                         timeout_ms,
                     });
                 }
-                Ok(_) => {
+                Ok(Some(_)) => {
                     // Already terminal (e.g., complete_wake transitioned
                     // it before this alarm fired). Skip; the inbox entry
                     // was removed at transition time per Decision 6.
                 }
-                Err(_) => {
+                Ok(None) => {
                     tracing::warn!(
                         wake_id = %wake_id,
                         "alarm-fire references missing wake row (defensive skip per Lock 2.6.8)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        wake_id = %wake_id,
+                        error = %e,
+                        "alarm-fire storage read failed (defensive skip per Lock 2.6.8)"
                     );
                 }
             }
@@ -226,8 +247,17 @@ impl DurableObject for TallyTeamDO {
                 inbox_updates.entry(target_b64.clone())
             {
                 let key = inbox_key(&target_b64);
-                let inbox: VecDeque<WakeId> =
-                    self.state.storage().get(&key).await.unwrap_or_default();
+                // worker 0.7+ Option return: missing row or storage error
+                // → empty inbox is the safe default here (transitions of
+                // wakes whose target had no inbox row are no-ops at the
+                // inbox level anyway).
+                let inbox: VecDeque<WakeId> = self
+                    .state
+                    .storage()
+                    .get(&key)
+                    .await
+                    .unwrap_or_default()
+                    .unwrap_or_default();
                 e.insert(inbox);
             }
         }
@@ -318,13 +348,17 @@ impl TallyTeamDO {
     /// "stringified DO identifier" rather than a strict format claim;
     /// populated here with the hex value per the worker-rs API.
     async fn ensure_team_meta_initialized(&self) -> Result<()> {
-        if self
-            .state
-            .storage()
-            .get::<TeamMeta>(TEAM_META_KEY)
-            .await
-            .is_err()
-        {
+        // worker 0.7+ `storage.get` returns `Result<Option<T>, _>`. Treat
+        // `Ok(None)` as "row doesn't exist yet" (the lazy-init trigger)
+        // and `Err(_)` as a transient storage problem we should retry by
+        // also initializing (the prior code did the same for the
+        // NotFound-as-error case; the upgrade now disambiguates them but
+        // the init action is unchanged in both arms).
+        let needs_init = match self.state.storage().get::<TeamMeta>(TEAM_META_KEY).await {
+            Ok(Some(_)) => false,
+            Ok(None) | Err(_) => true,
+        };
+        if needs_init {
             let meta = TeamMeta {
                 tenancy_prefix: TENANCY_PREFIX_MVP.to_string(),
                 team_id_b64: self.state.id().to_string(),
@@ -610,11 +644,17 @@ impl TallyTeamDO {
         let caller_b64 = caller.to_url_safe_b64();
 
         // ── 2. Sequential reads ───────────────────────────────────────
+        // worker 0.7+ `storage.get` returns `Result<Option<T>, _>`.
+        // Missing row → empty inbox / empty queue is the correct default
+        // here (first dispatch to this target / first wake registered);
+        // genuine storage error → fall through to empty as well (the
+        // commit path will surface the actual error on the write).
         let mut inbox: VecDeque<WakeId> = self
             .state
             .storage()
             .get(&inbox_key(&target_b64))
             .await
+            .unwrap_or_default()
             .unwrap_or_default();
 
         let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
@@ -622,6 +662,7 @@ impl TallyTeamDO {
             .storage()
             .get(ALARM_QUEUE_KEY)
             .await
+            .unwrap_or_default()
             .unwrap_or_default();
 
         // ── 3. Compute new state in locals ────────────────────────────
@@ -983,14 +1024,27 @@ impl TallyTeamDO {
         response_payload: Vec<u8>,
     ) -> StdResult<u64, TallyError> {
         // ── 2. Sequential reads ───────────────────────────────────────
+        // worker 0.7+ separates "row not found" from "storage error":
+        //   Ok(Some(record)) — row exists; proceed
+        //   Ok(None) — row genuinely missing; surface WakeNotFound (404)
+        //     per the dispatch contract
+        //   Err(e) — genuine storage failure; surface as
+        //     Stoa(WakeError::Other(...)) (500), the correct semantic
+        //     for a backing-store failure (vs. the prior code path that
+        //     conflated this with WakeNotFound)
         let wake = match self
             .state
             .storage()
             .get::<WakeRecord>(&wake_key(wake_id))
             .await
         {
-            Ok(r) => r,
-            Err(_) => return Err(TallyError::WakeNotFound),
+            Ok(Some(r)) => r,
+            Ok(None) => return Err(TallyError::WakeNotFound),
+            Err(e) => {
+                return Err(TallyError::Stoa(StoaError::Wake(WakeError::Other(
+                    format!("storage read wake row failed: {}", e),
+                ))));
+            }
         };
 
         // ── 3. State guard ────────────────────────────────────────────
@@ -1005,11 +1059,15 @@ impl TallyTeamDO {
         }
 
         // Continue sequential reads: alarm_queue, target inbox.
+        // worker 0.7+ Option return: missing row or storage error → empty
+        // is safe (alarm_queue cleanup is a no-op if the row was absent;
+        // inbox membership retain is a no-op against empty).
         let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
             .state
             .storage()
             .get(ALARM_QUEUE_KEY)
             .await
+            .unwrap_or_default()
             .unwrap_or_default();
 
         let mut inbox: VecDeque<WakeId> = self
@@ -1017,6 +1075,7 @@ impl TallyTeamDO {
             .storage()
             .get(&inbox_key(&wake.target_identity))
             .await
+            .unwrap_or_default()
             .unwrap_or_default();
 
         // ── 5. Compute new state in locals ────────────────────────────
@@ -1196,12 +1255,16 @@ impl TallyTeamDO {
         let limit = clamp_limit(query.limit);
         let wait_seconds = clamp_wait_seconds(query.wait_seconds);
 
-        // Read the inbox.
+        // Read the inbox. worker 0.7+ Option return: empty inbox is the
+        // safe default for both missing-row and storage-error cases (the
+        // read endpoint returns `{ wakes: [], more_available: false }`,
+        // which is the same observable shape as "no wakes pending").
         let mut inbox: VecDeque<WakeId> = self
             .state
             .storage()
             .get(&inbox_key(&identity_b64))
             .await
+            .unwrap_or_default()
             .unwrap_or_default();
 
         // Long-poll path per Decision 2: subscribe-first when inbox
@@ -1227,6 +1290,7 @@ impl TallyTeamDO {
                 .storage()
                 .get(&inbox_key(&identity_b64))
                 .await
+                .unwrap_or_default()
                 .unwrap_or_default();
 
             if !inbox.is_empty() {
@@ -1244,6 +1308,7 @@ impl TallyTeamDO {
                             .storage()
                             .get(&inbox_key(&identity_b64))
                             .await
+                            .unwrap_or_default()
                             .unwrap_or_default();
                     }
                     Either::Left((Err(_recv_error), _)) => {
@@ -1257,6 +1322,7 @@ impl TallyTeamDO {
                             .storage()
                             .get(&inbox_key(&identity_b64))
                             .await
+                            .unwrap_or_default()
                             .unwrap_or_default();
                     }
                     Either::Right(((), _receiver)) => {
@@ -1284,8 +1350,13 @@ impl TallyTeamDO {
 
         let mut summaries = Vec::with_capacity(limit.min(inbox_len));
         for wid in inbox.iter().take(limit) {
+            // worker 0.7+ tri-state: Ok(Some(wake)) → materialise;
+            // Ok(None) → defensive-skip per Lock 2.6.9 (inbox-row orphan
+            // from α.2 partial-failure); Err(_) → defensive-skip with the
+            // genuine storage error (same outward behavior — the inbox
+            // still references the missing row from the caller's POV).
             match self.state.storage().get::<WakeRecord>(&wake_key(wid)).await {
-                Ok(wake) => {
+                Ok(Some(wake)) => {
                     // F.1: `expires_at_ms` is derived from
                     // `created_at + timeout_ms`. The Worker layer
                     // formats it as ISO-8601 for the public
@@ -1299,7 +1370,7 @@ impl TallyTeamDO {
                         expires_at_ms,
                     });
                 }
-                Err(_) => {
+                Ok(None) => {
                     // Defensive skip per Lock 2.6.9: inbox entry
                     // references a wake row that no longer exists; most
                     // likely caused by dispatch's overflow-handling α.2
@@ -1308,6 +1379,13 @@ impl TallyTeamDO {
                     tracing::warn!(
                         wake_id = %wid,
                         "inbox references missing wake row (likely α.2 partial-failure orphan)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        wake_id = %wid,
+                        error = %e,
+                        "inbox materialisation: storage read failed (defensive skip per Lock 2.6.9)"
                     );
                 }
             }

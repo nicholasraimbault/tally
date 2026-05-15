@@ -125,7 +125,15 @@ impl TallyTeamDO {
         })?;
 
         let key = format!("agent:{}:handlers", identity.to_url_safe_b64());
-        let mut set: BTreeSet<String> = self.state.storage().get(&key).await.unwrap_or_default();
+        // worker 0.7+ `storage.get` Option return: missing row → start
+        // with an empty set (first-handler insert path).
+        let mut set: BTreeSet<String> = self
+            .state
+            .storage()
+            .get(&key)
+            .await
+            .unwrap_or_default()
+            .unwrap_or_default();
         set.insert(context_str.to_string());
         self.state.storage().put(&key, &set).await.map_err(|e| {
             StoaError::Wake(WakeError::Other(format!("storage write failed: {}", e)))
@@ -146,9 +154,22 @@ impl TallyTeamDO {
         })?;
 
         let key = format!("agent:{}:handlers", identity.to_url_safe_b64());
-        let Ok(mut set) = self.state.storage().get::<BTreeSet<String>>(&key).await else {
-            return Ok(());
-        };
+        // worker 0.7+ tri-state:
+        //   Ok(Some(set)) — handlers exist; proceed to remove + delete-on-empty
+        //   Ok(None) — no handlers registered; idempotent no-op (matches the
+        //     prior Err(_) early-return behavior, now disambiguated)
+        //   Err(_) — genuine storage failure; surface as a real error
+        let mut set: BTreeSet<String> =
+            match self.state.storage().get::<BTreeSet<String>>(&key).await {
+                Ok(Some(s)) => s,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    return Err(StoaError::Wake(WakeError::Other(format!(
+                        "storage read handlers failed: {}",
+                        e
+                    ))));
+                }
+            };
         set.remove(context_str);
 
         if set.is_empty() {

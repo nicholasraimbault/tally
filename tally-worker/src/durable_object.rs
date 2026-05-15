@@ -45,6 +45,13 @@ const TEAM_META_KEY: &str = "team:meta";
 /// by absolute timeout (unix millis).
 const ALARM_QUEUE_KEY: &str = "alarm_queue";
 
+/// Resolver send payload type — the `Ok` arm carries the
+/// `(response, completed_at)` tuple bridged from `complete_wake`
+/// (HTTP API surface sub-PR F.1 expansion). Factored as a type
+/// alias to satisfy `clippy::type_complexity` for the
+/// [`TallyTeamDO::wake_resolvers`] HashMap value.
+type WakeResolverResult = StdResult<(WakeResponse, u64), StoaError>;
+
 /// Build the per-target inbox storage key.
 fn inbox_key(identity_b64: &str) -> String {
     format!("agent:{}:inbox", identity_b64)
@@ -65,7 +72,16 @@ pub struct TallyTeamDO {
     /// [`TallyTeamDO::complete_wake`] and in the alarm-fire handler.
     /// Cloudflare DO eviction drops this; storage persists, alarm fires
     /// after rehydration, pending wakes route to TimedOut.
-    pub(crate) wake_resolvers: HashMap<WakeId, oneshot::Sender<StdResult<WakeResponse, StoaError>>>,
+    ///
+    /// **F.1 expansion:** the channel payload is the tuple `(WakeResponse,
+    /// u64)` carrying the response *and* the unix-millisecond timestamp
+    /// at which `complete_wake`'s `put_multiple_raw` committed. The
+    /// dispatching awaiter uses this timestamp to construct
+    /// [`crate::rpc::DispatchResponse::completed_at`]; the Worker layer
+    /// formats it as ISO-8601 for the public response. The error arm
+    /// (`StoaError`) carries no timestamp — error responses include
+    /// `wake_id` (the dispatch site has it) but not a `completed_at`.
+    pub(crate) wake_resolvers: HashMap<WakeId, oneshot::Sender<WakeResolverResult>>,
     /// In-memory map from target identity to the long-poll waiter's
     /// oneshot `Sender` for inbox-arrival notifications.
     ///
@@ -299,9 +315,16 @@ impl TallyTeamDO {
             Ok(id) => id,
             Err(e) => return Response::error(format!("invalid identity_b64: {}", e), 400),
         };
+        let ctx_id = body.context_id.clone();
         match WakeRouter::register_handler(self, &identity, body.context_id.as_bytes()).await {
             Ok(()) => Response::from_json(&OkResponse),
-            Err(e) => Ok(stoa_error_to_response(&e)),
+            Err(e) => Ok(stoa_error_to_response(
+                &e,
+                &ErrorContext {
+                    context_id: Some(&ctx_id),
+                    ..Default::default()
+                },
+            )),
         }
     }
 
@@ -311,9 +334,16 @@ impl TallyTeamDO {
             Ok(id) => id,
             Err(e) => return Response::error(format!("invalid identity_b64: {}", e), 400),
         };
+        let ctx_id = body.context_id.clone();
         match WakeRouter::unregister_handler(self, &identity, body.context_id.as_bytes()).await {
             Ok(()) => Response::from_json(&OkResponse),
-            Err(e) => Ok(stoa_error_to_response(&e)),
+            Err(e) => Ok(stoa_error_to_response(
+                &e,
+                &ErrorContext {
+                    context_id: Some(&ctx_id),
+                    ..Default::default()
+                },
+            )),
         }
     }
 
@@ -324,6 +354,15 @@ impl TallyTeamDO {
     /// [`Self::dispatch_with_caller`] → map result to
     /// [`DispatchResponse`] (HTTP 200) or error via
     /// [`stoa_error_to_response`].
+    ///
+    /// **F.1 expansion:** `dispatch_with_caller` now returns
+    /// `(Option<WakeId>, Result<(WakeResponse, u64), StoaError>)`. The
+    /// leading `Option<WakeId>` lets the error mapper populate the
+    /// `wake_id` field of §3.3's structured timeout response
+    /// (`{ "error": "wake timed out", "wake_id": "...", ... }`). The
+    /// success path constructs an internal [`DispatchResponse`] with
+    /// `wake_id` + `completed_at` (both new F.1 fields) so the Worker
+    /// layer can build the public response.
     async fn handle_dispatch(&mut self, req: &mut Request) -> Result<Response> {
         let body: DispatchRequest = match req.json().await {
             Ok(b) => b,
@@ -346,47 +385,57 @@ impl TallyTeamDO {
 
         // Validate context_id.
         if body.context_id.is_empty() {
-            return Ok(stoa_error_to_response(&StoaError::Wake(
-                WakeError::DispatchRefused {
+            return Ok(stoa_error_to_response(
+                &StoaError::Wake(WakeError::DispatchRefused {
                     reason: "context_id must be non-empty".to_string(),
-                },
-            )));
+                }),
+                &ErrorContext::default(),
+            ));
         }
 
         // Validate payload.
         let payload_bytes = match BASE64_URL_SAFE_NO_PAD.decode(body.payload_b64.as_bytes()) {
             Ok(b) => b,
             Err(e) => {
-                return Ok(stoa_error_to_response(&StoaError::Wake(
-                    WakeError::DispatchRefused {
+                return Ok(stoa_error_to_response(
+                    &StoaError::Wake(WakeError::DispatchRefused {
                         reason: format!("invalid payload_b64: {}", e),
-                    },
-                )));
+                    }),
+                    &ErrorContext::default(),
+                ));
             }
         };
         if payload_bytes.len() > MAX_PAYLOAD_BYTES {
-            return Ok(stoa_error_to_response(&StoaError::Wake(
-                WakeError::DispatchRefused {
+            return Ok(stoa_error_to_response(
+                &StoaError::Wake(WakeError::DispatchRefused {
                     reason: format!(
                         "payload {} bytes exceeds MAX_PAYLOAD_BYTES ({})",
                         payload_bytes.len(),
                         MAX_PAYLOAD_BYTES
                     ),
-                },
-            )));
+                }),
+                &ErrorContext::default(),
+            ));
         }
 
-        // Validate timeout. Zero / out-of-range → InvalidTimeout (504/400
-        // path via stoa_error_to_response).
+        // Validate timeout. Zero / out-of-range → InvalidTimeout (400 per
+        // §3.1 correction).
         if body.timeout_ms < MIN_TIMEOUT_MS || body.timeout_ms > MAX_TIMEOUT_MS {
-            return Ok(stoa_error_to_response(&StoaError::Wake(
-                WakeError::InvalidTimeout,
-            )));
+            return Ok(stoa_error_to_response(
+                &StoaError::Wake(WakeError::InvalidTimeout),
+                &ErrorContext::default(),
+            ));
         }
         let timeout = Duration::from_millis(body.timeout_ms as u64);
 
-        // Delegate to the inherent method.
-        match self
+        // Delegate to the inherent method. F.1: pattern-match the
+        // `(Option<WakeId>, Result<...>)` tuple so error responses can
+        // include `wake_id` when known.
+        //
+        // §3.3 HandlerNotFound includes a `context_id` field; we
+        // capture the body's context_id locally for that path.
+        let ctx_id = body.context_id.clone();
+        let (wake_id_opt, result) = self
             .dispatch_with_caller(
                 &target,
                 &caller,
@@ -394,25 +443,58 @@ impl TallyTeamDO {
                 WakePayload(payload_bytes),
                 timeout,
             )
-            .await
-        {
-            Ok(response) => {
+            .await;
+
+        match (wake_id_opt, result) {
+            (Some(wake_id), Ok((response, completed_at))) => {
                 let resp = DispatchResponse {
+                    wake_id,
                     responding_identity_b64: body.target_identity_b64,
                     response_payload_b64: BASE64_URL_SAFE_NO_PAD.encode(&response.0),
+                    completed_at,
                 };
                 Response::from_json(&resp)
             }
-            Err(e) => Ok(stoa_error_to_response(&e)),
+            (None, Ok(_)) => {
+                // dispatch_with_caller invariant: success path
+                // generates a wake_id before any await; reaching this
+                // arm means the (Option<WakeId>, Result) contract is
+                // violated. Surface as 500 with structured body rather
+                // than panicking.
+                Ok(stoa_error_to_response(
+                    &StoaError::Wake(WakeError::Other(
+                        "dispatch returned Ok without wake_id (invariant violation)".to_string(),
+                    )),
+                    &ErrorContext::default(),
+                ))
+            }
+            (wake_id_opt, Err(e)) => Ok(stoa_error_to_response(
+                &e,
+                &ErrorContext {
+                    wake_id: wake_id_opt.as_ref(),
+                    context_id: Some(&ctx_id),
+                },
+            )),
         }
     }
 
     /// Dispatch a wake — persistence-aware inherent method per Phase 0
-    /// Decision 9 + Lock 6.6.3.
+    /// Decision 9 + Lock 6.6.3, refined by HTTP API surface sub-PR F.1.
     ///
     /// The trait method [`WakeRouter::dispatch`] has no caller param;
     /// `WakeRecord` storage requires one (Decision 8). This inherent
     /// method is the operational implementation surface.
+    ///
+    /// **F.1 return-type expansion:** returns `(Option<WakeId>,
+    /// StdResult<(WakeResponse, u64), StoaError>)`. The leading
+    /// `Option<WakeId>` is the wake identifier *if it was already
+    /// generated* — `None` for pre-generation validation errors,
+    /// `Some(_)` once generation has happened (including the timeout
+    /// path, where the wake_id is needed for the 408 error response's
+    /// `wake_id` context field). The inner result's `Ok` arm carries
+    /// `(WakeResponse, completed_at)`; the `completed_at` value flows
+    /// from [`Self::complete_wake`] via the oneshot channel. See
+    /// [`crate::rpc::DispatchResponse`] for the matching response shape.
     ///
     /// Flow per Decision 5 (operation shape):
     /// 1. Pre-checks (in-memory): validate timeout, payload size,
@@ -446,30 +528,45 @@ impl TallyTeamDO {
         context: &[u8],
         payload: WakePayload,
         timeout: Duration,
-    ) -> StdResult<WakeResponse, StoaError> {
+    ) -> (Option<WakeId>, StdResult<(WakeResponse, u64), StoaError>) {
         // ── 1. Pre-checks ─────────────────────────────────────────────
-        let context_str = std::str::from_utf8(context).map_err(|_| {
-            StoaError::Wake(WakeError::DispatchRefused {
-                reason: "context must be valid UTF-8".to_string(),
-            })
-        })?;
+        // Pre-checks fire *before* wake_id generation; their error
+        // responses carry `None` for the wake_id context (no wake_id
+        // has been allocated yet).
+        let context_str = match std::str::from_utf8(context) {
+            Ok(s) => s,
+            Err(_) => {
+                return (
+                    None,
+                    Err(StoaError::Wake(WakeError::DispatchRefused {
+                        reason: "context must be valid UTF-8".to_string(),
+                    })),
+                );
+            }
+        };
         if context_str.is_empty() {
-            return Err(StoaError::Wake(WakeError::DispatchRefused {
-                reason: "context_id must be non-empty".to_string(),
-            }));
+            return (
+                None,
+                Err(StoaError::Wake(WakeError::DispatchRefused {
+                    reason: "context_id must be non-empty".to_string(),
+                })),
+            );
         }
         if payload.0.len() > MAX_PAYLOAD_BYTES {
-            return Err(StoaError::Wake(WakeError::DispatchRefused {
-                reason: format!(
-                    "payload {} bytes exceeds MAX_PAYLOAD_BYTES ({})",
-                    payload.0.len(),
-                    MAX_PAYLOAD_BYTES
-                ),
-            }));
+            return (
+                None,
+                Err(StoaError::Wake(WakeError::DispatchRefused {
+                    reason: format!(
+                        "payload {} bytes exceeds MAX_PAYLOAD_BYTES ({})",
+                        payload.0.len(),
+                        MAX_PAYLOAD_BYTES
+                    ),
+                })),
+            );
         }
         let timeout_ms_u128 = timeout.as_millis();
         if timeout_ms_u128 < MIN_TIMEOUT_MS as u128 || timeout_ms_u128 > MAX_TIMEOUT_MS as u128 {
-            return Err(StoaError::Wake(WakeError::InvalidTimeout));
+            return (None, Err(StoaError::Wake(WakeError::InvalidTimeout)));
         }
         let timeout_ms = timeout_ms_u128 as u32;
 
@@ -557,48 +654,111 @@ impl TallyTeamDO {
         }
 
         // ── 4. Atomic delete (overflow case only — α.2 ordering) ──────
+        // F.1: wake_id is now allocated; the post-generation error
+        // arms below carry `Some(wake_id)` so callers can populate the
+        // `wake_id` field in §3.3-style structured error responses.
         if let Some(ovid) = overflow_wake_id {
             if let Err(e) = self.state.storage().delete(&wake_key(&ovid)).await {
-                return Err(StoaError::Wake(WakeError::Other(format!(
-                    "dispatch overflow delete failed: {}",
-                    e
-                ))));
+                return (
+                    Some(wake_id),
+                    Err(StoaError::Wake(WakeError::Other(format!(
+                        "dispatch overflow delete failed: {}",
+                        e
+                    )))),
+                );
             }
         }
 
         // ── 5. Atomic multi-key put_multiple_raw ──────────────────────
         let writes = Object::new();
-        let record_jsv = serde_wasm_bindgen::to_value(&new_record).map_err(|e| {
-            StoaError::Wake(WakeError::Other(format!("serialize wake record: {}", e)))
-        })?;
-        Reflect::set(
+        let record_jsv = match serde_wasm_bindgen::to_value(&new_record) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    Some(wake_id),
+                    Err(StoaError::Wake(WakeError::Other(format!(
+                        "serialize wake record: {}",
+                        e
+                    )))),
+                );
+            }
+        };
+        if Reflect::set(
             &writes,
             &JsValue::from_str(&wake_key(&wake_id)),
             &record_jsv,
         )
-        .map_err(|_| StoaError::Wake(WakeError::Other("Reflect::set wake key".to_string())))?;
-        let inbox_jsv = serde_wasm_bindgen::to_value(&inbox)
-            .map_err(|e| StoaError::Wake(WakeError::Other(format!("serialize inbox: {}", e))))?;
-        Reflect::set(
+        .is_err()
+        {
+            return (
+                Some(wake_id),
+                Err(StoaError::Wake(WakeError::Other(
+                    "Reflect::set wake key".to_string(),
+                ))),
+            );
+        }
+        let inbox_jsv = match serde_wasm_bindgen::to_value(&inbox) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    Some(wake_id),
+                    Err(StoaError::Wake(WakeError::Other(format!(
+                        "serialize inbox: {}",
+                        e
+                    )))),
+                );
+            }
+        };
+        if Reflect::set(
             &writes,
             &JsValue::from_str(&inbox_key(&target_b64)),
             &inbox_jsv,
         )
-        .map_err(|_| StoaError::Wake(WakeError::Other("Reflect::set inbox key".to_string())))?;
-        let aq_jsv = serde_wasm_bindgen::to_value(&alarm_queue).map_err(|e| {
-            StoaError::Wake(WakeError::Other(format!("serialize alarm_queue: {}", e)))
-        })?;
-        Reflect::set(&writes, &JsValue::from_str(ALARM_QUEUE_KEY), &aq_jsv).map_err(|_| {
-            StoaError::Wake(WakeError::Other("Reflect::set alarm_queue key".to_string()))
-        })?;
-        self.state
-            .storage()
-            .put_multiple_raw(writes)
-            .await
-            .map_err(|e| StoaError::Wake(WakeError::Other(format!("put_multiple_raw: {}", e))))?;
+        .is_err()
+        {
+            return (
+                Some(wake_id),
+                Err(StoaError::Wake(WakeError::Other(
+                    "Reflect::set inbox key".to_string(),
+                ))),
+            );
+        }
+        let aq_jsv = match serde_wasm_bindgen::to_value(&alarm_queue) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    Some(wake_id),
+                    Err(StoaError::Wake(WakeError::Other(format!(
+                        "serialize alarm_queue: {}",
+                        e
+                    )))),
+                );
+            }
+        };
+        if Reflect::set(&writes, &JsValue::from_str(ALARM_QUEUE_KEY), &aq_jsv).is_err() {
+            return (
+                Some(wake_id),
+                Err(StoaError::Wake(WakeError::Other(
+                    "Reflect::set alarm_queue key".to_string(),
+                ))),
+            );
+        }
+        if let Err(e) = self.state.storage().put_multiple_raw(writes).await {
+            return (
+                Some(wake_id),
+                Err(StoaError::Wake(WakeError::Other(format!(
+                    "put_multiple_raw: {}",
+                    e
+                )))),
+            );
+        }
 
         // ── 6. Post-storage in-memory mutation + alarm scheduling ─────
-        let (sender, receiver) = oneshot::channel::<StdResult<WakeResponse, StoaError>>();
+        // F.1 channel payload: `(WakeResponse, u64)` where `u64` is the
+        // `completed_at` timestamp captured by `complete_wake`'s
+        // post-storage step. The error arm stays `StoaError` (timeout
+        // / resolver-drop / etc.).
+        let (sender, receiver) = oneshot::channel::<WakeResolverResult>();
         self.wake_resolvers.insert(wake_id, sender);
 
         // Reschedule alarm to the new earliest entry. The queue is
@@ -610,10 +770,13 @@ impl TallyTeamDO {
             // no alarm is set. Best-effort recovery: drop the resolver,
             // surface the error.
             self.wake_resolvers.remove(&wake_id);
-            return Err(StoaError::Wake(WakeError::Other(format!(
-                "set_alarm failed post-storage: {}",
-                e
-            ))));
+            return (
+                Some(wake_id),
+                Err(StoaError::Wake(WakeError::Other(format!(
+                    "set_alarm failed post-storage: {}",
+                    e
+                )))),
+            );
         }
 
         // Inbox-waiter signal per HTTP API surface sub-PR Phase 0
@@ -635,9 +798,9 @@ impl TallyTeamDO {
         let total_timeout = timeout + SAFETY_BUFFER;
         let delay = worker::Delay::from(total_timeout);
 
-        match select(receiver, delay).await {
-            Either::Left((result, _delay)) => match result {
-                Ok(Ok(response)) => Ok(response),
+        let result = match select(receiver, delay).await {
+            Either::Left((channel_result, _delay)) => match channel_result {
+                Ok(Ok((response, completed_at))) => Ok((response, completed_at)),
                 Ok(Err(e)) => Err(e),
                 Err(_recv_error) => Err(StoaError::Wake(WakeError::Other(
                     "resolver dropped without resolution (DO restart or bug)".to_string(),
@@ -646,7 +809,8 @@ impl TallyTeamDO {
             Either::Right(((), _receiver)) => {
                 Err(StoaError::Wake(WakeError::TimeoutExpired { timeout }))
             }
-        }
+        };
+        (Some(wake_id), result)
     }
 
     /// HTTP complete handler per Phase 0 Lock 6.6.2.
@@ -680,36 +844,71 @@ impl TallyTeamDO {
                 }
             };
         if response_payload.len() > MAX_RESPONSE_BYTES {
-            return Ok(stoa_error_to_response(&StoaError::Wake(
-                WakeError::DispatchRefused {
+            return Ok(stoa_error_to_response(
+                &StoaError::Wake(WakeError::DispatchRefused {
                     reason: format!(
                         "response {} bytes exceeds MAX_RESPONSE_BYTES ({})",
                         response_payload.len(),
                         MAX_RESPONSE_BYTES
                     ),
+                }),
+                &ErrorContext {
+                    wake_id: Some(&wake_id),
+                    ..Default::default()
                 },
-            )));
+            ));
         }
 
         match self
             .complete_wake(&wake_id, &by_identity, response_payload)
             .await
         {
-            Ok(()) => Response::from_json(&OkResponse),
-            Err(e) => Ok(tally_error_to_response(&e)),
+            // F.1 expansion: complete_wake now returns the
+            // `completed_at` timestamp. For the direct
+            // POST /complete path (caller is not the awaiting
+            // dispatcher), the internal success response carries
+            // `completed_at` so the Worker can include it in
+            // [`PublicCompleteResponse`] if desired. The current
+            // public spec (§3.3) for complete's success body
+            // (`{ "completed": true, "wake_id": "..." }`) doesn't
+            // include `completed_at`, but the internal value is
+            // available here for forward-compat extension. We pass
+            // through the timestamp in a JSON object so the Worker
+            // can ignore it without parsing complexity.
+            Ok(completed_at) => Response::from_json(&serde_json::json!({
+                "completed_at": completed_at,
+            })),
+            Err(e) => Ok(tally_error_to_response(
+                &e,
+                &ErrorContext {
+                    wake_id: Some(&wake_id),
+                    ..Default::default()
+                },
+            )),
         }
     }
 
     /// Complete a pending wake — Pending → Completed transition per
     /// Phase 0 Lock 6.6.4 (β.1).
     ///
-    /// Per HTTP API surface sub-PR Decision 4: returns `Result<(),
+    /// Per HTTP API surface sub-PR Decision 4: returns `Result<u64,
     /// TallyError>` rather than `Result<(), StoaError>`. The three
     /// implementation-specific error sites (wake row not found, wake
     /// not Pending, by_identity mismatch) are not dispatch protocol
     /// errors; they map to dedicated [`TallyError`] variants rather
     /// than to fudged [`stoa::WakeError`] variants. See
     /// `crate::error` for the full reasoning.
+    ///
+    /// **F.1 expansion:** the `Ok` arm carries the storage-write
+    /// timestamp (`Date::now().as_millis() as u64` captured immediately
+    /// after `put_multiple_raw` succeeds) as the `completed_at` value.
+    /// This timestamp flows through the [`Self::wake_resolvers`] oneshot
+    /// channel as the second tuple element so the dispatching awaiter
+    /// can populate [`DispatchResponse::completed_at`] without a
+    /// separate clock read. The timestamp is ephemeral coordination
+    /// data — it's the Cloudflare DO's wall-clock at write time, not
+    /// a persisted [`WakeRecord`] field (WakeRecord stays at 9 fields
+    /// per Decision 8).
     ///
     /// Flow per Decision 5 (operation shape):
     /// 1. Pre-checks: deserialize-time identity/wake_id validation done
@@ -729,16 +928,17 @@ impl TallyTeamDO {
     ///    per Lock 6.6.4); updated target inbox (wake_id removed per
     ///    Decision 6 transition contract).
     /// 6. Atomic `put_multiple_raw`: 3 keys (transitioned wake row +
-    ///    target inbox + alarm_queue).
+    ///    target inbox + alarm_queue). Capture `Date::now().as_millis()`
+    ///    immediately after for the `completed_at` return value.
     /// 7. Post-storage: resolve the in-memory resolver if present
-    ///    (best-effort); call `set_alarm` or `delete_alarm` for the new
-    ///    alarm_queue state.
+    ///    (best-effort) with `(WakeResponse, completed_at)`; call
+    ///    `set_alarm` or `delete_alarm` for the new alarm_queue state.
     pub(crate) async fn complete_wake(
         &mut self,
         wake_id: &WakeId,
         by_identity: &Identity,
         response_payload: Vec<u8>,
-    ) -> StdResult<(), TallyError> {
+    ) -> StdResult<u64, TallyError> {
         // ── 2. Sequential reads ───────────────────────────────────────
         let wake = match self
             .state
@@ -822,15 +1022,26 @@ impl TallyTeamDO {
             .await
             .map_err(|e| StoaError::Wake(WakeError::Other(format!("put_multiple_raw: {}", e))))?;
 
+        // F.1 expansion: capture the storage-write timestamp immediately
+        // after `put_multiple_raw` returns. This is the canonical
+        // `completed_at` value — the moment the durable transition
+        // committed. Used as the second tuple element on both the
+        // resolver send (so the dispatching awaiter doesn't need a
+        // separate clock read) and this function's return value (so
+        // a direct `POST /complete` HTTP caller — i.e. a caller that
+        // isn't the awaiting dispatcher — also receives the timestamp
+        // for inclusion in [`PublicCompleteResponse`] if needed).
+        let completed_at = Date::now().as_millis();
+
         // ── 7. Post-storage: resolve resolver + reschedule alarm ──────
         if let Some(sender) = self.wake_resolvers.remove(wake_id) {
-            let _ = sender.send(Ok(WakeResponse(response_payload)));
+            let _ = sender.send(Ok((WakeResponse(response_payload), completed_at)));
         }
         self.reschedule_alarm(&alarm_queue)
             .await
             .map_err(|e| StoaError::Wake(WakeError::Other(format!("reschedule_alarm: {}", e))))?;
 
-        Ok(())
+        Ok(completed_at)
     }
 
     /// Set or delete the DO alarm to match the alarm_queue's earliest
@@ -1021,12 +1232,20 @@ impl TallyTeamDO {
         let mut summaries = Vec::with_capacity(limit.min(inbox_len));
         for wid in inbox.iter().take(limit) {
             match self.state.storage().get::<WakeRecord>(&wake_key(wid)).await {
-                Ok(wake) => summaries.push(WakeSummary {
-                    wake_id: wid.to_string(),
-                    caller_identity_b64: wake.caller_identity,
-                    context_id: wake.context_id,
-                    payload_b64: BASE64_URL_SAFE_NO_PAD.encode(&wake.payload),
-                }),
+                Ok(wake) => {
+                    // F.1: `expires_at_ms` is derived from
+                    // `created_at + timeout_ms`. The Worker layer
+                    // formats it as ISO-8601 for the public
+                    // PublicWakeSummary.expires_at field.
+                    let expires_at_ms = wake.created_at + wake.timeout_ms as u64;
+                    summaries.push(WakeSummary {
+                        wake_id: wid.to_string(),
+                        caller_identity_b64: wake.caller_identity,
+                        context_id: wake.context_id,
+                        payload_b64: BASE64_URL_SAFE_NO_PAD.encode(&wake.payload),
+                        expires_at_ms,
+                    });
+                }
                 Err(_) => {
                     // Defensive skip per Lock 2.6.9: inbox entry
                     // references a wake row that no longer exists; most
@@ -1048,8 +1267,54 @@ impl TallyTeamDO {
     }
 }
 
+/// Per-error contextual fields for the structured-JSON error response.
+///
+/// HTTP API surface sub-PR F.1 expansion: §3.3 error response examples
+/// include contextual fields (e.g., `wake_id`, `context_id`,
+/// `timeout_seconds`) alongside the bare `error` string. Callers
+/// populate the context fields they have in scope; the error mapper
+/// drops unset fields from the response body.
+#[derive(Default)]
+pub(crate) struct ErrorContext<'a> {
+    /// Wake identifier — included for 404/408/410 responses.
+    pub(crate) wake_id: Option<&'a WakeId>,
+    /// Context identifier — included for 422 `HandlerNotFound`.
+    pub(crate) context_id: Option<&'a str>,
+}
+
+/// Build a structured-JSON error response per HTTP API surface sub-PR
+/// Phase 0 F.1 expansion.
+///
+/// Wire shape: `{ "error": "...", + contextual fields }`. Status is set
+/// via [`Response::with_status`] on a [`Response::from_json`] body.
+/// `with_status` is infallible; we only fail to construct a response if
+/// `Response::from_json` itself fails (which is essentially impossible
+/// for a serde_json::Value::Object built locally — included for
+/// completeness).
+pub(crate) fn json_error(
+    status: u16,
+    error: &str,
+    extras: &[(&str, serde_json::Value)],
+) -> Response {
+    let mut obj = serde_json::Map::new();
+    obj.insert("error".to_string(), serde_json::Value::String(error.into()));
+    for (k, v) in extras {
+        obj.insert((*k).to_string(), v.clone());
+    }
+    match Response::from_json(&serde_json::Value::Object(obj)) {
+        Ok(r) => r.with_status(status),
+        Err(_) => Response::empty().unwrap_or_else(|_| {
+            // Construction of an empty response itself failing is a
+            // platform-runtime invariant violation; degrade to a
+            // panic-equivalent by surfacing a default placeholder
+            // Response::error which won't fail for trivial inputs.
+            Response::error("internal error", status).unwrap()
+        }),
+    }
+}
+
 /// Map a `StoaError` to a `Response` per HTTP API surface sub-PR
-/// Phase 0 §3.1 error code mapping.
+/// Phase 0 §3.1 error code mapping + F.1 structured-JSON bodies.
 ///
 /// Corrections relative to the dispatch sub-PR's mapping:
 /// - `HandlerNotFound` → 422 (was 404). The condition is "client
@@ -1060,41 +1325,83 @@ impl TallyTeamDO {
 /// - `TimeoutExpired` → 408 (was 504). The wake timeout is the
 ///   client's requested timeout; 408 (Request Timeout) is the
 ///   conventional code for client-supplied-deadline exceeded.
-pub(crate) fn stoa_error_to_response(err: &StoaError) -> Response {
-    let response = match err {
-        StoaError::Wake(WakeError::HandlerNotFound) => Response::error(
-            "target identity has no eligibility registered for context",
-            422,
-        ),
+///
+/// **F.1 structured-body additions:** the response body is now JSON
+/// with an `error` field plus contextual fields per §3.3 examples:
+/// - 408 `TimeoutExpired`: `{ error, wake_id, timeout_seconds }`
+/// - 422 `HandlerNotFound`: `{ error, context_id }`
+/// - other codes: `{ error }` only.
+pub(crate) fn stoa_error_to_response(err: &StoaError, ctx: &ErrorContext<'_>) -> Response {
+    match err {
+        StoaError::Wake(WakeError::HandlerNotFound) => {
+            // §3.3 example: `{ "error": "target has no registered handler
+            // for context_id", "context_id": "task-routing" }`. The
+            // context_id is the public field name; the internal call
+            // sites pass it via ErrorContext::context_id.
+            let extras: Vec<(&str, serde_json::Value)> = match ctx.context_id {
+                Some(cid) => vec![("context_id", serde_json::Value::String(cid.into()))],
+                None => vec![],
+            };
+            json_error(
+                422,
+                "target has no registered handler for context_id",
+                &extras,
+            )
+        }
         StoaError::Wake(WakeError::DispatchRefused { reason }) => {
-            Response::error(format!("dispatch refused: {}", reason), 422)
+            // §3.3 doesn't show DispatchRefused with extras; the reason
+            // string is the only context (already in `error`).
+            json_error(422, reason, &[])
         }
-        StoaError::Wake(WakeError::TimeoutExpired { .. }) => Response::error("wake timed out", 408),
-        StoaError::Wake(WakeError::InvalidTimeout) => Response::error("timeout must be > 0", 400),
+        StoaError::Wake(WakeError::TimeoutExpired { timeout }) => {
+            // §3.3 example: `{ "error": "wake timed out", "wake_id":
+            // "01J5...", "timeout_seconds": 30 }`. timeout_seconds is
+            // computed from the carried Duration; wake_id flows via
+            // ErrorContext from the dispatch site.
+            let mut extras: Vec<(&str, serde_json::Value)> = Vec::with_capacity(2);
+            if let Some(wid) = ctx.wake_id {
+                extras.push(("wake_id", serde_json::Value::String(wid.to_string())));
+            }
+            extras.push((
+                "timeout_seconds",
+                serde_json::Value::Number(serde_json::Number::from(timeout.as_secs())),
+            ));
+            json_error(408, "wake timed out", &extras)
+        }
+        StoaError::Wake(WakeError::InvalidTimeout) => json_error(400, "timeout must be > 0", &[]),
         StoaError::Wake(WakeError::Other(msg)) => {
-            Response::error(format!("internal error: {}", msg), 500)
+            json_error(500, &format!("internal error: {}", msg), &[])
         }
-        _ => Response::error("internal error", 500),
-    };
-    response.unwrap_or_else(|_| Response::empty().unwrap())
+        _ => json_error(500, "internal error", &[]),
+    }
 }
 
 /// Map a [`TallyError`] to a `Response` per HTTP API surface sub-PR
-/// Phase 0 §3.1.
+/// Phase 0 §3.1 + F.1 structured-JSON bodies.
 ///
 /// Delegates [`TallyError::Stoa`] to [`stoa_error_to_response`] so the
 /// dispatch-scoped error mapping stays in one place. Tally-specific
 /// variants:
-/// - [`TallyError::WakeNotFound`] → 404 (the wake row doesn't exist)
-/// - [`TallyError::AlreadyTerminal`] → 410 (gone; resource lifecycle ended)
-/// - [`TallyError::IdentityMismatch`] → 403 (forbidden; auth identity ≠
-///   wake's target)
-pub(crate) fn tally_error_to_response(err: &TallyError) -> Response {
-    let response = match err {
-        TallyError::Stoa(stoa_err) => return stoa_error_to_response(stoa_err),
-        TallyError::WakeNotFound => Response::error("wake not found", 404),
-        TallyError::AlreadyTerminal => Response::error("wake already in terminal state", 410),
-        TallyError::IdentityMismatch => Response::error("identity does not match wake target", 403),
-    };
-    response.unwrap_or_else(|_| Response::empty().unwrap())
+/// - [`TallyError::WakeNotFound`] → 404 with `{ error, wake_id }`
+/// - [`TallyError::AlreadyTerminal`] → 410 with `{ error, wake_id }`
+/// - [`TallyError::IdentityMismatch`] → 403 with `{ error }` only
+pub(crate) fn tally_error_to_response(err: &TallyError, ctx: &ErrorContext<'_>) -> Response {
+    match err {
+        TallyError::Stoa(stoa_err) => stoa_error_to_response(stoa_err, ctx),
+        TallyError::WakeNotFound => {
+            let extras: Vec<(&str, serde_json::Value)> = match ctx.wake_id {
+                Some(wid) => vec![("wake_id", serde_json::Value::String(wid.to_string()))],
+                None => vec![],
+            };
+            json_error(404, "wake not found", &extras)
+        }
+        TallyError::AlreadyTerminal => {
+            let extras: Vec<(&str, serde_json::Value)> = match ctx.wake_id {
+                Some(wid) => vec![("wake_id", serde_json::Value::String(wid.to_string()))],
+                None => vec![],
+            };
+            json_error(410, "wake already in terminal state", &extras)
+        }
+        TallyError::IdentityMismatch => json_error(403, "identity does not match wake target", &[]),
+    }
 }

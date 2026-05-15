@@ -218,7 +218,7 @@ Implementation of the test scenarios surfaced four PR #18 production-code gaps t
 
 Corrections land as part of this PR with explicit acknowledgment, matching the §9.1 Decision 6.6.4 + §9.2 TallyError patterns (mid-implementation corrections to a prior sub-PR's locked decisions surfaced during the next sub-PR's work, folded into that next PR rather than carved into a separate retroactive fix-PR). The integration tests in this PR are the surface that catches and exercises these corrections; bundling them is more honest than separating provenance.
 
-The fourth gap is also a Layer 4 data point: static doc-review (the agent's first-pass surfacing) caught 3 of the 4; CI's actual execution caught the 4th. Worth carrying forward to future Pattern C work — static review of "does this look right against docs" remains valuable but doesn't fully substitute for "actually run the thing on the target."
+Static review caught 3 of 4 gaps; the 4th surfaced in CI's actual integration run. Same Layer 4 lesson as PR #17's tokio runtime gap and CI strict checks — verify against the actual target.
 
 ## Methodology note
 

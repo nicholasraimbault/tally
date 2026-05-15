@@ -22,9 +22,9 @@ use worker::DurableObject;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use futures::future::{select, Either};
-use js_sys::{Object, Reflect};
+use js_sys::{Array, Object, Reflect};
 use tokio::sync::oneshot;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 
 use stoa::types::Identity;
 use stoa::wake_router::{WakePayload, WakeResponse};
@@ -37,9 +37,9 @@ use crate::dispatch_consts::{
 };
 use crate::error::TallyError;
 use crate::rpc::{
-    CompleteRequest, DispatchRequest, DispatchResponse, OkResponse, ReadInboxQuery,
-    ReadInboxResponse, RegisterRequest, UnregisterRequest, ValidateApiKeyRequest,
-    ValidateApiKeyResponse, WakeSummary,
+    CompleteRequest, DispatchRequest, DispatchResponse, InitTeamResponse, OkResponse,
+    ReadInboxQuery, ReadInboxResponse, RegisterRequest, RegisteredAgent, TeamStatusResponse,
+    UnregisterRequest, ValidateApiKeyRequest, ValidateApiKeyResponse, WakeSummary,
 };
 use crate::wake_types::{WakeId, WakeRecord, WakeState};
 
@@ -142,6 +142,13 @@ impl DurableObject for TallyTeamDO {
             }
             (Method::Post, "/complete") => self.handle_complete_wake(&mut req).await,
             (Method::Post, "/validate_api_key") => self.handle_validate_api_key(&mut req).await,
+            // CLI sub-PR Path A: team-administrative sub-routes. POST
+            // for action verbs (init, delete) matches the existing
+            // pattern (/unregister, /complete) where internal DO routes
+            // use POST regardless of public-route HTTP method.
+            (Method::Post, "/team/init") => self.handle_team_init().await,
+            (Method::Get, "/team/status") => self.handle_team_status().await,
+            (Method::Post, "/team/delete") => self.handle_team_delete().await,
             _ => Response::error("not found", 404),
         }
     }
@@ -1433,6 +1440,152 @@ impl TallyTeamDO {
             wakes: summaries,
             more_available,
         })
+    }
+
+    // ─── CLI sub-PR Path A: team-administrative handlers ──────────────────
+    //
+    // The 3 routes (init/status/delete) implement operator-facing
+    // team-state lifecycle per cli-sub-pr-phase-0.md. Auth at the public
+    // boundary is uniform-true Bearer (D5); no URL-path identity to
+    // match against. The Worker forwards authenticated requests here
+    // and these handlers operate on DO storage directly.
+
+    /// Handle `POST /team/init` — return the current TeamMeta.
+    ///
+    /// `ensure_team_meta_initialized` already ran at the top of `fetch`,
+    /// so by the time this handler is invoked `team:meta` is guaranteed
+    /// to exist. Idempotent: repeated calls return the same
+    /// `initialized_at_ms` (the first-init timestamp), not a refreshed
+    /// "re-init" time.
+    async fn handle_team_init(&self) -> Result<Response> {
+        let meta: TeamMeta = match self.state.storage().get(TEAM_META_KEY).await {
+            Ok(Some(m)) => m,
+            Ok(None) | Err(_) => {
+                // Cannot reach in practice — ensure_team_meta_initialized
+                // ran first. Surface as 500 for visibility if the
+                // invariant is ever violated.
+                return Response::error("team_meta missing after init", 500);
+            }
+        };
+        let resp = InitTeamResponse {
+            team_id_b64: meta.team_id_b64,
+            initialized_at_ms: meta.created_at as u64,
+            tenancy_prefix: meta.tenancy_prefix,
+        };
+        Response::from_json(&resp)
+    }
+
+    /// Handle `GET /team/status` — enumerate registered agents and
+    /// inbox depths.
+    ///
+    /// Lists storage keys with prefix `agent:` to discover distinct
+    /// identities (the storage schema doesn't maintain a separate
+    /// registered-agents index — listing is acceptable for the
+    /// operator-diagnostic frequency of this endpoint). For each
+    /// identity, reads `agent:{identity_b64}:handlers` (the registered
+    /// context_ids set) and `agent:{identity_b64}:inbox` (the pending-
+    /// wake queue) to populate the response.
+    async fn handle_team_status(&self) -> Result<Response> {
+        let meta: TeamMeta = match self.state.storage().get(TEAM_META_KEY).await {
+            Ok(Some(m)) => m,
+            Ok(None) | Err(_) => {
+                return Response::error("team_meta missing after init", 500);
+            }
+        };
+
+        // Phase 1: discover distinct identities via key listing.
+        let opts = ListOptions::new().prefix("agent:");
+        let map = self.state.storage().list_with_options(opts).await?;
+        let entries = Array::from(&map.entries());
+        let mut identities: BTreeSet<String> = BTreeSet::new();
+        for i in 0..entries.length() {
+            // Each entry from Map.entries() is a [key, value] Array.
+            // `dyn_into` returns Err if the JsValue isn't actually an
+            // Array; we defensively skip rather than panic on an
+            // unexpected runtime shape.
+            let entry: Array = match entries.get(i).dyn_into::<Array>() {
+                Ok(arr) => arr,
+                Err(_) => continue,
+            };
+            let key = match entry.get(0).as_string() {
+                Some(k) => k,
+                None => continue,
+            };
+            // Storage keys with `agent:` prefix have the shape
+            // `agent:{identity_b64}:{suffix}` (e.g. `:handlers`,
+            // `:inbox`, `:api_keys`). Extract the identity_b64 segment
+            // between the two colons.
+            if let Some(rest) = key.strip_prefix("agent:") {
+                if let Some(colon_idx) = rest.find(':') {
+                    identities.insert(rest[..colon_idx].to_string());
+                }
+            }
+        }
+
+        // Phase 2: per-identity reads (handlers + inbox depth).
+        let mut registered_agents: Vec<RegisteredAgent> = Vec::with_capacity(identities.len());
+        let mut total_inbox_depth: u64 = 0;
+        for identity_b64 in &identities {
+            let handlers_key = format!("agent:{}:handlers", identity_b64);
+            let handlers: BTreeSet<String> = self
+                .state
+                .storage()
+                .get::<BTreeSet<String>>(&handlers_key)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let inbox: VecDeque<WakeId> = self
+                .state
+                .storage()
+                .get::<VecDeque<WakeId>>(&inbox_key(identity_b64))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let inbox_depth = inbox.len() as u64;
+            total_inbox_depth = total_inbox_depth.saturating_add(inbox_depth);
+            registered_agents.push(RegisteredAgent {
+                identity_b64: identity_b64.clone(),
+                contexts: handlers.into_iter().collect(),
+                inbox_depth,
+            });
+        }
+
+        let resp = TeamStatusResponse {
+            team_id_b64: meta.team_id_b64,
+            initialized_at_ms: meta.created_at as u64,
+            tenancy_prefix: meta.tenancy_prefix,
+            registered_agents,
+            total_inbox_depth,
+        };
+        Response::from_json(&resp)
+    }
+
+    /// Handle `POST /team/delete` — clear all DO storage and any
+    /// scheduled alarm.
+    ///
+    /// After this returns the DO instance is effectively empty;
+    /// `ensure_team_meta_initialized` will re-initialize on the next
+    /// request (a fresh TeamMeta with a new `created_at`). Operator
+    /// intent is "tear down this team's Tally state"; the upstream
+    /// Stoa team is preserved (it lives in skytale's storage, not
+    /// tally's).
+    async fn handle_team_delete(&self) -> Result<Response> {
+        // delete_alarm first so a pending alarm doesn't fire post-wipe
+        // against empty storage (the alarm handler reads `alarm_queue`
+        // which would be missing).
+        if let Err(e) = self.state.storage().delete_alarm().await {
+            tracing::warn!(error = %e, "delete_alarm failed during team delete (continuing)");
+        }
+        // Drop in-memory bookkeeping. The map borrows are scoped to
+        // drop before the await on delete_all.
+        {
+            self.wake_resolvers.borrow_mut().clear();
+            self.inbox_waiters.borrow_mut().clear();
+        }
+        self.state.storage().delete_all().await?;
+        Response::empty().map(|r| r.with_status(204))
     }
 }
 

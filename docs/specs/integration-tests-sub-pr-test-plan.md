@@ -205,25 +205,21 @@ Existing 7 CI checks must continue to pass:
 Plus new:
 - **Integration tests crate (compile + lint)** — `cargo check --manifest-path integration-tests/Cargo.toml --tests`; `cargo clippy --manifest-path integration-tests/Cargo.toml --all-targets -- -D warnings`; `cargo fmt --check` (in `integration-tests/`). These verify the test crate compiles and is lint-clean without running `wrangler dev`.
 
-**Deferred (blocked on worker-rs upgrade)**: actually executing the integration tests against `wrangler dev`. See § "CI execution status: blocked on worker-rs upgrade" below.
+**CI runtime resolved**: see § "CI execution status: resolved by worker-rs upgrade" below for the unblocking sub-PR's context.
 
-## CI execution status: blocked on worker-rs upgrade
+## CI execution status: resolved by worker-rs upgrade
 
-The integration test scaffolding lands in this PR (standalone test crate at `integration-tests/`, `TestHarness` fixture, 16 scenarios catalogued and implemented as Rust test functions). The CI runtime that actually executes `wrangler dev` against the tests is **deferred** until a future sub-PR upgrades the `worker` dep from "0.5" to a current release compatible with present-day worker-build / wasm-bindgen-cli releases.
+CI runtime resolved by the `upgrade-worker-rs` sub-PR (bumped `worker` from "0.5" to "0.8.3"). The integration tests CI job that the PR #19 deferral comment described now runs against the upgraded toolchain — all 16 catalogued scenarios execute in the new `Integration tests` workflow job (Node.js + Wrangler install, pre-built worker via worker-build, `cargo test --manifest-path integration-tests/Cargo.toml --tests -- --test-threads=1`).
 
-**Concrete blocker**: tally pins `worker = "0.5"` (architectural commitment from prior sessions). The current toolchain doesn't compose cleanly with that pin:
+**Historical context** (retained for provenance — the deferral and its concrete blockers): the initial integration-tests sub-PR (PR #19) landed the standalone test crate at `integration-tests/`, `TestHarness` fixture, and 16 scenarios as Rust test functions but deferred CI runtime because `worker = "0.5"` did not compose cleanly with current worker-build / wasm-bindgen-cli releases:
 
 - `worker-build` 0.8.3 (latest) requires `worker >= 0.8.3`
-- `worker-build` 0.1.14 (older series, ostensibly compatible with worker 0.5) bundles `wasm-bindgen-cli` 0.2.105, which doesn't match tally's transitively-resolved `wasm-bindgen` 0.2.121 (different bindgen format)
-- No identified worker-build version cleanly bridges worker 0.5 and current wasm-bindgen
+- `worker-build` 0.1.14 bundled `wasm-bindgen-cli` 0.2.105, mismatching tally's transitively-resolved `wasm-bindgen` 0.2.121
+- No worker-build version cleanly bridged worker 0.5 and current wasm-bindgen
 
-Six fixes deep into PR #18 toolchain corrections during this PR, the cumulative pattern signaled that the foundation (worker 0.5 pin) doesn't compose with current tooling; one more version pin would just defer the next collision. The right move is to stop the cascade here and address the architectural premise in a separate sub-PR.
+Six fixes deep into the PR #19 toolchain cascade, the cumulative pattern signaled the foundation (worker 0.5 pin) didn't compose with current tooling. The deferral framing was correct; the `upgrade-worker-rs` sub-PR is the mechanical follow-up that re-enables the runtime once the architectural premise is resolved.
 
-**This PR's CI scope** (post-cleanup): the integration tests crate compiles + lints via a new `Integration tests crate (compile + lint)` CI job (does NOT run `wrangler dev`). The 7 pre-existing tally-worker CI jobs remain green.
-
-**Future sub-PR scope** (upgrade worker-rs): upgrade `worker = "0.5"` to current (≥ 0.8.3); resolve API breakage in tally-worker; update wrangler.toml compat flags; verify all of PR #17 + PR #18 behaviors hold; then re-enable the integration tests CI runtime (the test crate code in this PR will run as-is once the toolchain composes cleanly).
-
-Local verification before PR open: run the 7 tally-worker CI commands + 3 integration-tests-crate commands (10 checks).
+Local verification: run the full CI surface — 7 tally-worker jobs + 3 integration-tests-crate commands + (if wrangler available) the integration runtime locally.
 
 ## Mid-implementation correction note
 

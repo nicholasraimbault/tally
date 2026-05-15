@@ -8,7 +8,7 @@
 //! paths (`complete_wake` / alarm-fire).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::time::Duration;
@@ -646,6 +646,40 @@ impl TallyTeamDO {
 
         let target_b64 = target.to_url_safe_b64();
         let caller_b64 = caller.to_url_safe_b64();
+
+        // ── Handler registration pre-check (Phase 0 Decision 9 step 1) ────
+        // Reads agent:{target_b64}:handlers; if context_str isn't in the
+        // registered set, return HandlerNotFound before any storage writes.
+        // Per the worker 0.7+ tri-state on storage.get:
+        //   Ok(Some(set)) — handlers exist; check membership
+        //   Ok(None) — no handlers registered for this target → not-registered
+        //   Err(e) — genuine storage failure → surface as Other (500), not 422
+        //     (collapsing to HandlerNotFound would over-claim; storage error
+        //     is genuinely ambiguous about whether the handler is registered)
+        let handlers_key = format!("agent:{}:handlers", target_b64);
+        let handlers: Option<BTreeSet<String>> = match self
+            .state
+            .storage()
+            .get::<BTreeSet<String>>(&handlers_key)
+            .await
+        {
+            Ok(opt) => opt,
+            Err(e) => {
+                return (
+                    None,
+                    Err(StoaError::Wake(WakeError::Other(format!(
+                        "storage read failed (handlers): {}",
+                        e
+                    )))),
+                );
+            }
+        };
+        let handler_registered = handlers
+            .as_ref()
+            .is_some_and(|set| set.contains(context_str));
+        if !handler_registered {
+            return (None, Err(StoaError::Wake(WakeError::HandlerNotFound)));
+        }
 
         // ── 2. Sequential reads ───────────────────────────────────────
         // worker 0.7+ `storage.get` returns `Result<Option<T>, _>`.

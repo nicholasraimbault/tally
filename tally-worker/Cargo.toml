@@ -78,10 +78,17 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 # alone is insufficient per upstream docs.
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
-# wasm-bindgen is invisible to cargo-machete because it's referenced
-# only via #[durable_object]'s macro expansion
-# (#[wasm_bindgen::prelude::wasm_bindgen] absolute attribute path)
-# rather than via source-level `use wasm_bindgen::...` statements. The
-# crate is required at crate root for attribute resolution.
+# Deps used but invisible to cargo-machete's source-walk:
+# - getrandom: required to flow the `wasm_js` feature flag into ulid's
+#   transitive getrandom dep. Consumed via the dependency graph + the
+#   `--cfg getrandom_backend="wasm_js"` rustflag in .cargo/config.toml,
+#   not via direct `use` in source.
+# - serde_bytes: used via `#[serde(with = "serde_bytes")]` attribute on
+#   WakeRecord's payload and response_payload fields. The attribute
+#   path is invisible to machete's import-based detection.
+#
+# wasm-bindgen previously appeared here for the #[durable_object] macro
+# expansion case, but machete now correctly resolves it via wasm_bindgen::
+# direct uses (e.g., JsValue in put_multiple_raw's Object construction).
 [package.metadata.cargo-machete]
-ignored = ["wasm-bindgen"]
+ignored = ["getrandom", "serde_bytes"]

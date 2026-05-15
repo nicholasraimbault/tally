@@ -48,3 +48,13 @@ base64 = "0.22"
 # repo convention (thiserror for library crates, anyhow for binary
 # crates).
 anyhow = "1"
+
+# Process-group signal handling in TestHarness's Drop impl. `wrangler
+# dev` spawns a `workerd` grandchild that survives a per-PID SIGKILL;
+# spawning wrangler in its own process group via
+# `Command::process_group(0)` + signaling the group via
+# `libc::kill(-pgid, SIGKILL)` propagates the kill to the grandchild.
+# See issue #26 for the leak that surfaced this need (PR #25's
+# verification cycle).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

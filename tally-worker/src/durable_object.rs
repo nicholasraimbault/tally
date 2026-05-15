@@ -344,7 +344,11 @@ impl DurableObject for TallyTeamDO {
                     console_log!(
                         "[alarm_diag] wake_id={} lookup in resolvers: {}",
                         dw.wake_id,
-                        if removed.is_some() { "FOUND" } else { "MISSING" }
+                        if removed.is_some() {
+                            "FOUND"
+                        } else {
+                            "MISSING"
+                        }
                     );
                     removed.map(|s| (s, dw.timeout_ms, dw.wake_id))
                 })
@@ -359,7 +363,11 @@ impl DurableObject for TallyTeamDO {
             console_log!(
                 "[alarm_diag] wake_id={} send result: {}",
                 wake_id,
-                if send_result.is_ok() { "OK" } else { "RECEIVER_DROPPED" }
+                if send_result.is_ok() {
+                    "OK"
+                } else {
+                    "RECEIVER_DROPPED"
+                }
             );
         }
 

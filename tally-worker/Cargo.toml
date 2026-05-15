@@ -51,15 +51,22 @@ async-trait = { workspace = true }
 # - base64: HTTP transport b64 encoding/decoding for payloads
 #   (already transitively present via stoa, declared direct here
 #   for source-level use).
-# - tokio with `sync` (oneshot::channel) and `time`
-#   (tokio::time::timeout safety wrapper per Decision 9).
+# - tokio with `sync` only (oneshot::channel). The `time` feature
+#   is intentionally excluded: `tokio::time::timeout` panics at
+#   runtime on wasm32-unknown-unknown (no timer driver). The
+#   dispatch safety-timeout wrapper uses `worker::Delay` raced via
+#   `futures::future::select` instead (Decision 9 correction).
+# - futures: `future::select` + `Either` to race the oneshot
+#   Receiver against `worker::Delay` (Decision 9 safety wrapper).
+#   `std` features only — no async-io or executor pieces needed.
 # - tracing: structured warn-level logs at the defensive-skip and
 #   invariant-violation surfaces (Phase 0 Decisions 5, 11; Locks
 #   2.6.8, 2.6.9). No platform-specific deps; wasm32-compatible.
 serde_bytes = "0.11"
 ulid = { version = "1", features = ["serde"] }
 base64 = "0.22"
-tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # getrandom 0.3 (transitive via ulid) requires the `wasm_js` feature on

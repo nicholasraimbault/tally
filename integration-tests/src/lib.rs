@@ -86,9 +86,10 @@ pub struct TestHarness {
     /// accommodates long-poll dispatch (which blocks server-side for
     /// the duration of `timeout_seconds`).
     pub client: reqwest::Client,
-    /// The wrangler subprocess. `tokio::process::Child` because we
-    /// spawn from an async context; SIGKILL on Drop.
-    wrangler_process: Child,
+    /// The wrangler subprocess. `None` in production-verification mode
+    /// (when `TALLY_INTEGRATION_BASE_URL` is set to point at a deployed
+    /// Worker); `Some` in the default `wrangler dev --local` flow.
+    wrangler_process: Option<Child>,
 }
 
 impl TestHarness {
@@ -106,11 +107,36 @@ impl TestHarness {
     /// - `--persist-to <tmpdir>`: per-test ephemeral storage; on next
     ///   test setup the DO state is cold.
     ///
+    /// # Production-verification mode
+    ///
+    /// If `TALLY_INTEGRATION_BASE_URL` is set in the environment, the
+    /// harness uses that URL as `base_url` and skips the `wrangler dev`
+    /// subprocess spawn entirely. Used for closing the alarm-emulation
+    /// deferral from PR #20 (wrangler dev --local doesn't fire DO
+    /// alarms; deployed Workers do). With the env var set, the
+    /// readiness probe still runs against `/v1/health` to confirm the
+    /// deployed Worker is reachable before tests proceed.
+    ///
     /// # Errors
-    /// - `wrangler` binary not found on PATH.
-    /// - Subprocess spawn failure.
+    /// - `wrangler` binary not found on PATH (default mode only).
+    /// - Subprocess spawn failure (default mode only).
     /// - `/v1/health` doesn't return 200 within 30s.
     pub async fn setup() -> Result<Self> {
+        // Production-verification mode: skip wrangler subprocess.
+        if let Ok(base_url) = std::env::var("TALLY_INTEGRATION_BASE_URL") {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .context("build reqwest client")?;
+            let mut harness = Self {
+                base_url,
+                client,
+                wrangler_process: None,
+            };
+            harness.wait_for_ready().await?;
+            return Ok(harness);
+        }
+
         let port: u16 = std::env::var("TALLY_INTEGRATION_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -174,7 +200,7 @@ impl TestHarness {
         let mut harness = Self {
             base_url,
             client,
-            wrangler_process,
+            wrangler_process: Some(wrangler_process),
         };
 
         harness.wait_for_ready().await?;
@@ -217,7 +243,10 @@ impl TestHarness {
     /// reporting. Not for ongoing log capture.
     async fn drain_stderr_best_effort(&mut self) -> String {
         use tokio::io::AsyncReadExt as _;
-        let Some(mut stderr) = self.wrangler_process.stderr.take() else {
+        let Some(process) = self.wrangler_process.as_mut() else {
+            return "<production-verification mode; no wrangler subprocess>".to_string();
+        };
+        let Some(mut stderr) = process.stderr.take() else {
             return "<no stderr captured>".to_string();
         };
         let mut buf = vec![0u8; 16 * 1024];
@@ -467,8 +496,11 @@ impl Drop for TestHarness {
         // need to wait — the OS reaps the process; for tests that's
         // fine. `kill_on_drop(true)` set during spawn ensures the
         // subprocess also dies if the runtime is dropped before
-        // Drop fires.
-        let _ = self.wrangler_process.start_kill();
+        // Drop fires. No-op in production-verification mode (no
+        // subprocess to kill).
+        if let Some(process) = self.wrangler_process.as_mut() {
+            let _ = process.start_kill();
+        }
     }
 }
 

@@ -160,6 +160,12 @@ fn cross_team_isolation() {
 }
 
 #[test]
+#[ignore = "Depends on alarm-fire signal flow; wrangler dev --local does \
+            not invoke DO alarm handlers, so the long-poll wake-up via \
+            inbox_waiters signal that's coupled to dispatch's post-storage \
+            step doesn't surface in local CI. Same emulation gap as \
+            error_408_timeout (verified empirically in PR #20). Run \
+            manually against real Workers deployment to verify."]
 fn long_poll_wake_up() {
     // Per test plan §"Scenario catalog" P2 #3: bob subscribes to his
     // inbox with wait_seconds=30; alice dispatches at T+1s; bob's

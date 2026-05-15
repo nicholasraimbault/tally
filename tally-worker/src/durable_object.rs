@@ -7,6 +7,7 @@
 //! between the dispatch await path (oneshot Receiver) and the resolution
 //! paths (`complete_wake` / alarm-fire).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::result::Result as StdResult;
 use std::str::FromStr;
@@ -22,7 +23,7 @@ use tokio::sync::oneshot;
 use wasm_bindgen::JsValue;
 
 use stoa::types::Identity;
-use stoa::wake_router::{WakePayload, WakeResponse, WakeRouter};
+use stoa::wake_router::{WakePayload, WakeResponse};
 use stoa::{StoaError, WakeError};
 use tally_core::TeamMeta;
 
@@ -81,7 +82,17 @@ pub struct TallyTeamDO {
     /// formats it as ISO-8601 for the public response. The error arm
     /// (`StoaError`) carries no timestamp — error responses include
     /// `wake_id` (the dispatch site has it) but not a `completed_at`.
-    pub(crate) wake_resolvers: HashMap<WakeId, oneshot::Sender<WakeResolverResult>>,
+    ///
+    /// **`RefCell` rationale (worker-rs 0.6.0 upgrade):** `DurableObject`
+    /// trait methods now take `&self` rather than `&mut self`. Interior
+    /// mutability is required for the in-memory bookkeeping maps.
+    /// `RefCell` (not `Mutex`) because Cloudflare's Durable Objects are
+    /// single-threaded — only one event-loop task runs at a time per DO
+    /// instance — so the synchronization overhead of `Mutex` would be
+    /// pure cost without benefit. **All `borrow_mut()` borrows must be
+    /// scoped to drop before any `.await`** to avoid runtime panics from
+    /// a borrow held across a yield point.
+    pub(crate) wake_resolvers: RefCell<HashMap<WakeId, oneshot::Sender<WakeResolverResult>>>,
     /// In-memory map from target identity to the long-poll waiter's
     /// oneshot `Sender` for inbox-arrival notifications.
     ///
@@ -92,20 +103,21 @@ pub struct TallyTeamDO {
     /// post-storage and best-effort sends `()` to wake up the waiter.
     /// Cloudflare DO eviction drops this map; waiting clients receive
     /// `RecvError` and gracefully degrade to re-read.
-    pub(crate) inbox_waiters: HashMap<String, oneshot::Sender<()>>,
+    ///
+    /// See [`Self::wake_resolvers`] for the `RefCell` rationale.
+    pub(crate) inbox_waiters: RefCell<HashMap<String, oneshot::Sender<()>>>,
 }
 
-#[durable_object]
 impl DurableObject for TallyTeamDO {
     fn new(state: State, _env: Env) -> Self {
         Self {
             state,
-            wake_resolvers: HashMap::new(),
-            inbox_waiters: HashMap::new(),
+            wake_resolvers: RefCell::new(HashMap::new()),
+            inbox_waiters: RefCell::new(HashMap::new()),
         }
     }
 
-    async fn fetch(&mut self, mut req: Request) -> Result<Response> {
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
         // Lazy team:meta initialization on first request (Phase 0 §4.3).
         self.ensure_team_meta_initialized().await?;
 
@@ -140,7 +152,7 @@ impl DurableObject for TallyTeamDO {
     /// in-memory resolvers with `TimeoutExpired` and reschedules the alarm
     /// to the next-earliest entry (or deletes the alarm if the queue is
     /// empty).
-    async fn alarm(&mut self) -> Result<Response> {
+    async fn alarm(&self) -> Result<Response> {
         let now_ms = Date::now().as_millis();
 
         let mut alarm_queue: BTreeMap<u64, Vec<WakeId>> = self
@@ -266,12 +278,26 @@ impl DurableObject for TallyTeamDO {
 
         // Post-storage: resolve in-memory resolvers (best-effort per
         // Lock 4.6.3 — Sender::send Err if Receiver dropped is no-op).
-        for dw in &transitions {
-            if let Some(sender) = self.wake_resolvers.remove(&dw.wake_id) {
-                let _ = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
-                    timeout: Duration::from_millis(dw.timeout_ms as u64),
-                })));
-            }
+        //
+        // RefCell discipline: scope `borrow_mut` to the synchronous
+        // removal step. We collect the (Sender, timeout_ms) pairs into a
+        // local Vec inside the borrow scope and drop the borrow before
+        // calling `Sender::send` (also synchronous, but kept outside the
+        // borrow as a habit-forming pattern — borrows don't compose with
+        // future awaits). The next `.await` is `reschedule_alarm` below;
+        // the borrow MUST be dropped before reaching it.
+        let resolver_sends: Vec<(oneshot::Sender<WakeResolverResult>, u32)> = {
+            let mut resolvers = self.wake_resolvers.borrow_mut();
+            transitions
+                .iter()
+                .filter_map(|dw| resolvers.remove(&dw.wake_id).map(|s| (s, dw.timeout_ms)))
+                .collect()
+            // `resolvers` borrow drops at end of scope.
+        };
+        for (sender, timeout_ms) in resolver_sends {
+            let _ = sender.send(Err(StoaError::Wake(WakeError::TimeoutExpired {
+                timeout: Duration::from_millis(timeout_ms as u64),
+            })));
         }
 
         // Reschedule alarm to the next-earliest entry (or delete it).
@@ -291,7 +317,7 @@ impl TallyTeamDO {
     /// `team_id_b64` field name uses the `_b64` suffix as shorthand for
     /// "stringified DO identifier" rather than a strict format claim;
     /// populated here with the hex value per the worker-rs API.
-    async fn ensure_team_meta_initialized(&mut self) -> Result<()> {
+    async fn ensure_team_meta_initialized(&self) -> Result<()> {
         if self
             .state
             .storage()
@@ -309,14 +335,20 @@ impl TallyTeamDO {
         Ok(())
     }
 
-    async fn handle_register(&mut self, req: &mut Request) -> Result<Response> {
+    async fn handle_register(&self, req: &mut Request) -> Result<Response> {
         let body: RegisterRequest = req.json().await?;
         let identity = match Identity::from_url_safe_b64(&body.identity_b64) {
             Ok(id) => id,
             Err(e) => return Response::error(format!("invalid identity_b64: {}", e), 400),
         };
         let ctx_id = body.context_id.clone();
-        match WakeRouter::register_handler(self, &identity, body.context_id.as_bytes()).await {
+        // Call the `&self` inherent method rather than the `&mut self`
+        // `WakeRouter` trait method. See `wake_router.rs` for why the
+        // trait impl is a loud-failure stub post-0.6.0 upgrade.
+        match self
+            .register_handler_inherent(&identity, body.context_id.as_bytes())
+            .await
+        {
             Ok(()) => Response::from_json(&OkResponse),
             Err(e) => Ok(stoa_error_to_response(
                 &e,
@@ -328,14 +360,18 @@ impl TallyTeamDO {
         }
     }
 
-    async fn handle_unregister(&mut self, req: &mut Request) -> Result<Response> {
+    async fn handle_unregister(&self, req: &mut Request) -> Result<Response> {
         let body: UnregisterRequest = req.json().await?;
         let identity = match Identity::from_url_safe_b64(&body.identity_b64) {
             Ok(id) => id,
             Err(e) => return Response::error(format!("invalid identity_b64: {}", e), 400),
         };
         let ctx_id = body.context_id.clone();
-        match WakeRouter::unregister_handler(self, &identity, body.context_id.as_bytes()).await {
+        // See `handle_register` for why we call the inherent method.
+        match self
+            .unregister_handler_inherent(&identity, body.context_id.as_bytes())
+            .await
+        {
             Ok(()) => Response::from_json(&OkResponse),
             Err(e) => Ok(stoa_error_to_response(
                 &e,
@@ -363,7 +399,7 @@ impl TallyTeamDO {
     /// success path constructs an internal [`DispatchResponse`] with
     /// `wake_id` + `completed_at` (both new F.1 fields) so the Worker
     /// layer can build the public response.
-    async fn handle_dispatch(&mut self, req: &mut Request) -> Result<Response> {
+    async fn handle_dispatch(&self, req: &mut Request) -> Result<Response> {
         let body: DispatchRequest = match req.json().await {
             Ok(b) => b,
             Err(e) => return Response::error(format!("invalid request body: {}", e), 400),
@@ -522,7 +558,7 @@ impl TallyTeamDO {
     /// and panics at runtime; `worker::Delay` is the wasm-compatible
     /// substitute.
     pub(crate) async fn dispatch_with_caller(
-        &mut self,
+        &self,
         target: &Identity,
         caller: &Identity,
         context: &[u8],
@@ -759,7 +795,9 @@ impl TallyTeamDO {
         // post-storage step. The error arm stays `StoaError` (timeout
         // / resolver-drop / etc.).
         let (sender, receiver) = oneshot::channel::<WakeResolverResult>();
-        self.wake_resolvers.insert(wake_id, sender);
+        // RefCell discipline: scoped borrow_mut, dropped before the next
+        // `.await` (reschedule_alarm). The borrow is purely synchronous.
+        self.wake_resolvers.borrow_mut().insert(wake_id, sender);
 
         // Reschedule alarm to the new earliest entry. The queue is
         // non-empty (just added our entry); but reschedule_alarm
@@ -769,7 +807,7 @@ impl TallyTeamDO {
             // the dispatch in a half-state where the wake row exists but
             // no alarm is set. Best-effort recovery: drop the resolver,
             // surface the error.
-            self.wake_resolvers.remove(&wake_id);
+            self.wake_resolvers.borrow_mut().remove(&wake_id);
             return (
                 Some(wake_id),
                 Err(StoaError::Wake(WakeError::Other(format!(
@@ -787,7 +825,12 @@ impl TallyTeamDO {
         // Best-effort: `sender.send(())` returning `Err(())` means the
         // Receiver was dropped (subscriber timed out or was replaced by
         // a newer subscribe). Not an error to log.
-        if let Some(sender) = self.inbox_waiters.remove(&target_b64) {
+        //
+        // RefCell discipline: extract the Sender under a scoped
+        // borrow_mut, drop the borrow, then send synchronously outside
+        // the borrow scope.
+        let inbox_waiter = self.inbox_waiters.borrow_mut().remove(&target_b64);
+        if let Some(sender) = inbox_waiter {
             let _ = sender.send(());
         }
 
@@ -816,7 +859,7 @@ impl TallyTeamDO {
     /// HTTP complete handler per Phase 0 Lock 6.6.2.
     ///
     /// Wire-format per dispatch sub-PR Phase 0 §2 (`CompleteRequest`).
-    async fn handle_complete_wake(&mut self, req: &mut Request) -> Result<Response> {
+    async fn handle_complete_wake(&self, req: &mut Request) -> Result<Response> {
         let body: CompleteRequest = match req.json().await {
             Ok(b) => b,
             Err(e) => return Response::error(format!("invalid request body: {}", e), 400),
@@ -934,7 +977,7 @@ impl TallyTeamDO {
     ///    (best-effort) with `(WakeResponse, completed_at)`; call
     ///    `set_alarm` or `delete_alarm` for the new alarm_queue state.
     pub(crate) async fn complete_wake(
-        &mut self,
+        &self,
         wake_id: &WakeId,
         by_identity: &Identity,
         response_payload: Vec<u8>,
@@ -1034,7 +1077,12 @@ impl TallyTeamDO {
         let completed_at = Date::now().as_millis();
 
         // ── 7. Post-storage: resolve resolver + reschedule alarm ──────
-        if let Some(sender) = self.wake_resolvers.remove(wake_id) {
+        // RefCell discipline: extract the Sender under a scoped
+        // borrow_mut, drop the borrow, then send synchronously outside
+        // the borrow scope — the next `.await` (reschedule_alarm) MUST
+        // NOT happen while a borrow is held.
+        let resolver = self.wake_resolvers.borrow_mut().remove(wake_id);
+        if let Some(sender) = resolver {
             let _ = sender.send(Ok((WakeResponse(response_payload), completed_at)));
         }
         self.reschedule_alarm(&alarm_queue)
@@ -1078,7 +1126,7 @@ impl TallyTeamDO {
     /// written until Phase 2). Tally MVP must not be deployed to
     /// publicly-accessible environments without Phase 2 auth in place
     /// (Phase 0 §4.4 deployment boundary).
-    async fn handle_validate_api_key(&mut self, req: &mut Request) -> Result<Response> {
+    async fn handle_validate_api_key(&self, req: &mut Request) -> Result<Response> {
         let body: ValidateApiKeyRequest = req.json().await?;
 
         // MVP: bearer is the URL-safe-base64 identity. Parse success →
@@ -1117,7 +1165,7 @@ impl TallyTeamDO {
     /// Lock 2.6.9 (α.2 partial-failure orphan); a skipped row counts
     /// against the limit (the inbox still references it) so
     /// `more_available` reflects the storage state honestly.
-    async fn handle_read_inbox(&mut self, req: &Request, identity_b64: String) -> Result<Response> {
+    async fn handle_read_inbox(&self, req: &Request, identity_b64: String) -> Result<Response> {
         // Worker is responsible for the URL identity ↔ authenticated
         // identity check (per Decision 3). Validate the b64 string here
         // as a defence-in-depth check — if the Worker forwarded garbage,
@@ -1162,7 +1210,12 @@ impl TallyTeamDO {
         // step with the now-populated inbox.
         if inbox.is_empty() && wait_seconds > 0 {
             let (tx, rx) = oneshot::channel::<()>();
-            self.inbox_waiters.insert(identity_b64.clone(), tx);
+            // RefCell discipline: scope each borrow_mut to the
+            // synchronous mutation and drop it before the next `.await`
+            // (the storage re-read below).
+            self.inbox_waiters
+                .borrow_mut()
+                .insert(identity_b64.clone(), tx);
 
             // Re-read AFTER insert: catches the case where dispatch
             // appended between our initial read and our insert. The
@@ -1179,7 +1232,7 @@ impl TallyTeamDO {
             if !inbox.is_empty() {
                 // Inbox populated during the subscribe window; remove
                 // our waiter and proceed.
-                self.inbox_waiters.remove(&identity_b64);
+                self.inbox_waiters.borrow_mut().remove(&identity_b64);
             } else {
                 let delay = worker::Delay::from(Duration::from_secs(wait_seconds.into()));
                 match select(rx, delay).await {
@@ -1212,7 +1265,7 @@ impl TallyTeamDO {
                         // newer subscriber raced in and replaced us,
                         // they'll see RecvError on their Receiver and
                         // route to the re-read path.
-                        self.inbox_waiters.remove(&identity_b64);
+                        self.inbox_waiters.borrow_mut().remove(&identity_b64);
                         // Empty response (inbox stayed empty for the
                         // full long-poll window).
                     }

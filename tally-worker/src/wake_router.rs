@@ -6,6 +6,22 @@
 //! method `TallyTeamDO::dispatch_with_caller` (a `pub(crate)` item) is
 //! the operational implementation — see the doc-comment on `dispatch`
 //! below for the trait-vs-persistence-driven-caller framing.
+//!
+//! **worker-rs 0.8.3 upgrade (impedance with stoa's `&mut self` trait
+//! signatures):** Cloudflare's `DurableObject::fetch(&self, ...)` is
+//! now `&self`, so `handle_register` / `handle_unregister` (the HTTP
+//! handlers) only have `&self` available — they cannot invoke
+//! `WakeRouter::register_handler(self, ...)` which requires
+//! `&mut self`. Resolution mirrors the `dispatch_with_caller` pattern
+//! (Phase 0 Decision 10): the operational implementation lives in
+//! `pub(crate)` `&self` inherent methods on `TallyTeamDO`
+//! (`register_handler_inherent` / `unregister_handler_inherent`); the
+//! trait impl continues to satisfy the stoa contract but is a
+//! loud-failure stub because no `&mut TallyTeamDO` is reachable from
+//! any tally call site (the `#[durable_object]` macro owns the
+//! instance and dispatches only through `&self`). Forward-compatibility:
+//! if stoa relaxes the trait to `&self`, the stubs collapse into thin
+//! forwarders.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -20,23 +36,24 @@ use crate::durable_object::TallyTeamDO;
 
 #[async_trait(?Send)]
 impl WakeRouter for TallyTeamDO {
-    /// Register eligibility per Phase 0 §3.1.
+    /// Register eligibility — C-A-1 loud-failure stub.
+    ///
+    /// The operational implementation is `TallyTeamDO`'s inherent
+    /// `register_handler_inherent` (`&self`). This trait stub exists
+    /// only to satisfy the `WakeRouter` contract; it is not reachable
+    /// from production because no call site holds an
+    /// `&mut TallyTeamDO` (Cloudflare's runtime owns the instance and
+    /// invokes everything through `&self` methods on the trait).
     async fn register_handler(
         &mut self,
-        identity: &Identity,
-        context: &[u8],
+        _identity: &Identity,
+        _context: &[u8],
     ) -> Result<(), StoaError> {
-        let context_str = std::str::from_utf8(context).map_err(|_| {
-            StoaError::Wake(WakeError::Other("context must be valid UTF-8".to_string()))
-        })?;
-
-        let key = format!("agent:{}:handlers", identity.to_url_safe_b64());
-        let mut set: BTreeSet<String> = self.state.storage().get(&key).await.unwrap_or_default();
-        set.insert(context_str.to_string());
-        self.state.storage().put(&key, &set).await.map_err(|e| {
-            StoaError::Wake(WakeError::Other(format!("storage write failed: {}", e)))
-        })?;
-        Ok(())
+        unimplemented!(
+            "TallyTeamDO::WakeRouter::register_handler: use the &self inherent \
+             register_handler_inherent (&mut self trait signature is unreachable \
+             after the worker-rs 0.8.3 upgrade — DurableObject::fetch is &self)"
+        )
     }
 
     /// Dispatch a wake — C-A-1 loud-failure stub per dispatch sub-PR
@@ -75,9 +92,52 @@ impl WakeRouter for TallyTeamDO {
         )
     }
 
-    /// Unregister eligibility with delete-on-empty per Phase 0 §3.2.
+    /// Unregister eligibility — C-A-1 loud-failure stub. See
+    /// [`Self::register_handler`] for the framing.
     async fn unregister_handler(
         &mut self,
+        _identity: &Identity,
+        _context: &[u8],
+    ) -> Result<(), StoaError> {
+        unimplemented!(
+            "TallyTeamDO::WakeRouter::unregister_handler: use the &self inherent \
+             unregister_handler_inherent (&mut self trait signature is unreachable \
+             after the worker-rs 0.8.3 upgrade — DurableObject::fetch is &self)"
+        )
+    }
+}
+
+impl TallyTeamDO {
+    /// Inherent register-handler implementation per Phase 0 §3.1 —
+    /// operational counterpart to the loud-failure [`WakeRouter::register_handler`]
+    /// trait stub.
+    ///
+    /// Called from [`crate::durable_object::TallyTeamDO::handle_register`]
+    /// via inherent dispatch. `&self` (not `&mut self`) — `DurableObject`
+    /// trait methods are `&self` as of worker-rs 0.6.0.
+    pub(crate) async fn register_handler_inherent(
+        &self,
+        identity: &Identity,
+        context: &[u8],
+    ) -> Result<(), StoaError> {
+        let context_str = std::str::from_utf8(context).map_err(|_| {
+            StoaError::Wake(WakeError::Other("context must be valid UTF-8".to_string()))
+        })?;
+
+        let key = format!("agent:{}:handlers", identity.to_url_safe_b64());
+        let mut set: BTreeSet<String> = self.state.storage().get(&key).await.unwrap_or_default();
+        set.insert(context_str.to_string());
+        self.state.storage().put(&key, &set).await.map_err(|e| {
+            StoaError::Wake(WakeError::Other(format!("storage write failed: {}", e)))
+        })?;
+        Ok(())
+    }
+
+    /// Inherent unregister-handler implementation per Phase 0 §3.2
+    /// (delete-on-empty) — operational counterpart to the loud-failure
+    /// [`WakeRouter::unregister_handler`] trait stub.
+    pub(crate) async fn unregister_handler_inherent(
+        &self,
         identity: &Identity,
         context: &[u8],
     ) -> Result<(), StoaError> {

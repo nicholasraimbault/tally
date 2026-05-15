@@ -186,12 +186,15 @@ fn error_404_wake_not_found() {
 }
 
 #[test]
-#[ignore = "wrangler dev --local does not invoke DO alarm handlers; \
-            set_alarm returns Ok but alarm() never fires. Verified \
-            empirically via diagnostic logging in PR #20. Production \
-            Cloudflare Workers fires DO alarms reliably; this is a \
-            miniflare/wrangler-dev emulation gap. Run manually against \
-            real Workers deployment to verify alarm-based timeout path."]
+// Previously #[ignore]'d (PR #20) with attribution to "wrangler dev
+// --local does not invoke DO alarm handlers; miniflare/wrangler-dev
+// emulation gap." That attribution was misdiagnosis. The actual root
+// cause was that tally-worker's `reschedule_alarm` passed an absolute
+// unix-millisecond timestamp to `set_alarm(i64)` while worker-rs's
+// `From<i64> for ScheduledTime` interprets the value as offset-ms-
+// from-`Date::now()`. Alarms were scheduled for ~year 57,000 CE and
+// never fired in EITHER wrangler dev --local OR production. Fixed on
+// the `alarm-fire-diag` branch; the test is now un-ignored.
 fn error_408_timeout() {
     let runtime = rt();
     let harness = runtime

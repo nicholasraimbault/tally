@@ -160,12 +160,21 @@ fn cross_team_isolation() {
 }
 
 #[test]
-#[ignore = "Depends on alarm-fire signal flow; wrangler dev --local does \
-            not invoke DO alarm handlers, so the long-poll wake-up via \
-            inbox_waiters signal that's coupled to dispatch's post-storage \
-            step doesn't surface in local CI. Same emulation gap as \
-            error_408_timeout (verified empirically in PR #20). Run \
-            manually against real Workers deployment to verify."]
+// Previously #[ignore]'d (PR #20) with attribution to the same
+// "wrangler dev --local emulation gap" framing as
+// `error_408_timeout`. That attribution was misdiagnosis on two
+// counts:
+//   (a) The wrangler-dev framing was wrong — the actual root cause
+//       was tally-worker's `reschedule_alarm` passing absolute
+//       unix-millisecond timestamps to `set_alarm(i64)`, which
+//       worker-rs interprets as offset-from-now (so alarms were
+//       scheduled for year ~57,000 CE in BOTH wrangler dev AND
+//       production).
+//   (b) This test's wake-up signal flows through `inbox_waiters`
+//       (set in `dispatch_with_caller`'s post-storage step) —
+//       structurally independent of alarm-fire. The original
+//       attribution conflated two distinct signal paths.
+// Fixed on the `alarm-fire-diag` branch; the test is now un-ignored.
 fn long_poll_wake_up() {
     // Per test plan §"Scenario catalog" P2 #3: bob subscribes to his
     // inbox with wait_seconds=30; alice dispatches at T+1s; bob's

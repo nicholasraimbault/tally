@@ -1,6 +1,6 @@
 name = "tally"
 main = "tally-worker/build/worker/shim.mjs"
-compatibility_date = "2026-05-13"
+compatibility_date = "2026-05-03"
 compatibility_flags = ["http_request_timeout"]
 
 [[durable_objects.bindings]]

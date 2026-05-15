@@ -16,6 +16,7 @@ use worker::*;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use futures::future::{select, Either};
 use js_sys::{Object, Reflect};
 use tokio::sync::oneshot;
 use wasm_bindgen::JsValue;
@@ -410,10 +411,14 @@ impl TallyTeamDO {
     ///    `delete_alarm` if alarm_queue ends up empty — shouldn't
     ///    happen here since we just added our entry).
     ///
-    /// Awaits the oneshot Receiver wrapped in
-    /// `tokio::time::timeout(timeout + SAFETY_BUFFER, receiver)` as a
+    /// Awaits the oneshot Receiver raced against a `worker::Delay` of
+    /// `timeout + SAFETY_BUFFER` via `futures::future::select` as a
     /// belt-and-suspenders safety net. The alarm-based timeout is the
-    /// canonical path; the tokio wrapper is the defensive backstop.
+    /// canonical path; the `worker::Delay` race is the defensive
+    /// backstop. `tokio::time::timeout` is not used here because
+    /// `tokio::time` has no timer driver on `wasm32-unknown-unknown`
+    /// and panics at runtime; `worker::Delay` is the wasm-compatible
+    /// substitute.
     pub(crate) async fn dispatch_with_caller(
         &mut self,
         target: &Identity,
@@ -597,14 +602,23 @@ impl TallyTeamDO {
         // (No-op in this sub-PR.)
 
         // ── Await resolution with safety timeout ──────────────────────
+        // `tokio::time::timeout` is unusable on wasm32-unknown-unknown
+        // (no timer driver; panics at runtime). Substitute the
+        // wasm-compatible `worker::Delay` raced via `futures::future::select`.
         let total_timeout = timeout + SAFETY_BUFFER;
-        match tokio::time::timeout(total_timeout, receiver).await {
-            Ok(Ok(Ok(response))) => Ok(response),
-            Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_recv_error)) => Err(StoaError::Wake(WakeError::Other(
-                "resolver dropped without resolution (DO restart or bug)".to_string(),
-            ))),
-            Err(_elapsed) => Err(StoaError::Wake(WakeError::TimeoutExpired { timeout })),
+        let delay = worker::Delay::from(total_timeout);
+
+        match select(receiver, delay).await {
+            Either::Left((result, _delay)) => match result {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(e)) => Err(e),
+                Err(_recv_error) => Err(StoaError::Wake(WakeError::Other(
+                    "resolver dropped without resolution (DO restart or bug)".to_string(),
+                ))),
+            },
+            Either::Right(((), _receiver)) => {
+                Err(StoaError::Wake(WakeError::TimeoutExpired { timeout }))
+            }
         }
     }
 

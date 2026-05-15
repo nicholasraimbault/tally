@@ -420,6 +420,44 @@ impl TestHarness {
         let url = format!("{}/v1/health", self.base_url);
         self.client.get(&url).send().await.context("GET /v1/health")
     }
+
+    /// `POST /v1/teams/{team_id}/init` — provision the TallyTeamDO.
+    ///
+    /// CLI sub-PR Path A route. Auth is uniform-true Bearer; the
+    /// operator's identity is sent as the Bearer per cli-sub-pr-
+    /// phase-0.md D4. Returns the team's metadata (idempotent on
+    /// repeat calls).
+    pub async fn team_init(&self, team_id: &str, bearer: &str) -> Result<Response> {
+        let url = format!("{}/v1/teams/{}/init", self.base_url, team_id);
+        self.client
+            .post(&url)
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .context("POST .../init")
+    }
+
+    /// `GET /v1/teams/{team_id}/status` — read team routing state.
+    pub async fn team_status(&self, team_id: &str, bearer: &str) -> Result<Response> {
+        let url = format!("{}/v1/teams/{}/status", self.base_url, team_id);
+        self.client
+            .get(&url)
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .context("GET .../status")
+    }
+
+    /// `DELETE /v1/teams/{team_id}` — tear down the team's Tally state.
+    pub async fn team_delete(&self, team_id: &str, bearer: &str) -> Result<Response> {
+        let url = format!("{}/v1/teams/{}", self.base_url, team_id);
+        self.client
+            .delete(&url)
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .context("DELETE .../teams/{team_id}")
+    }
 }
 
 impl Drop for TestHarness {
@@ -500,4 +538,35 @@ pub struct ErrorBody {
 /// `payload` / `response` wire format per §3.3.
 pub fn b64_encode(bytes: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
+}
+
+// ─── CLI sub-PR Path A response shapes (team init/status/delete) ──────────
+
+/// Public response body for `POST /v1/teams/{team_id}/init`. Mirrors
+/// `tally-worker/src/rpc.rs::PublicInitTeamResponse`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InitTeamResponse {
+    pub team_id: String,
+    pub initialized_at: String,
+    pub tenancy_prefix: String,
+}
+
+/// Public response body for `GET /v1/teams/{team_id}/status`. Mirrors
+/// `tally-worker/src/rpc.rs::PublicTeamStatusResponse`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TeamStatusResponse {
+    pub team_id: String,
+    pub initialized_at: String,
+    pub tenancy_prefix: String,
+    pub registered_agents: Vec<RegisteredAgent>,
+    pub total_inbox_depth: u64,
+}
+
+/// Per-agent summary entry in [`TeamStatusResponse`]. Mirrors
+/// `tally-worker/src/rpc.rs::PublicRegisteredAgent`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegisteredAgent {
+    pub identity: String,
+    pub contexts: Vec<String>,
+    pub inbox_depth: u64,
 }

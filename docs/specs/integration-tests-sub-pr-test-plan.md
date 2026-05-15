@@ -209,13 +209,16 @@ Local verification before PR open: run the full set including the new integratio
 
 ## Mid-implementation correction note
 
-Implementation of the test scenarios surfaced three PR #18 production-code gaps that no §9.2 test exercised:
+Implementation of the test scenarios surfaced four PR #18 production-code gaps that no §9.2 test exercised. The first three came from static doc-review during implementation; the fourth surfaced empirically when CI tried to actually run `worker-build`:
 
 - **DO binding name mismatch** (`tally-worker/src/lib.rs:108`): `DO_BINDING = "tally-team"` did not match `wrangler.toml`'s declared `name = "TALLY_TEAM_DO"`. `env.durable_object()` does case-sensitive property lookup; the mismatch would return `undefined` at runtime. Fixed: align to `"TALLY_TEAM_DO"`.
 - **Self-referential `script_name` in `wrangler.toml`**: the `script_name = "tally"` field on the DO binding self-references the Worker's own name. Cloudflare's `script_name` is for cross-Worker DO references; self-reference confuses `wrangler dev`'s binding resolution. Fixed: removed.
 - **`id_from_string` vs Phase 0 §3.2's URL-safe-b64 team_id semantic** (`tally-worker/src/lib.rs:185`): `id_from_string` requires a 64-hex DO ID from `State::id()`'s stringified form — incompatible with caller-provided URL-safe identifiers. Fixed: switched to `id_from_name`, which derives the DO ID via internal SHA-256 hash of any UTF-8 name. Test harness's `new_team_id()` simplified to return a ULID string (matches §3.2's URL-safe-b64 intent).
+- **`worker-build` invoked from workspace root** (`wrangler.toml` + CI workflow): the workspace's root `Cargo.toml` has only `[workspace]` (no `[package]`); `worker-build` rejects it with `missing field 'package'`. The build must run from the `tally-worker/` package directory. Fixed: `wrangler.toml` `[build] command` and CI's `Build worker (release)` step now `cd tally-worker` (CI uses `working-directory:` step option); `wrangler.toml` `main` updated to `tally-worker/build/worker/shim.mjs` to point to the correct output location.
 
 Corrections land as part of this PR with explicit acknowledgment, matching the §9.1 Decision 6.6.4 + §9.2 TallyError patterns (mid-implementation corrections to a prior sub-PR's locked decisions surfaced during the next sub-PR's work, folded into that next PR rather than carved into a separate retroactive fix-PR). The integration tests in this PR are the surface that catches and exercises these corrections; bundling them is more honest than separating provenance.
+
+The fourth gap is also a Layer 4 data point: static doc-review (the agent's first-pass surfacing) caught 3 of the 4; CI's actual execution caught the 4th. Worth carrying forward to future Pattern C work — static review of "does this look right against docs" remains valuable but doesn't fully substitute for "actually run the thing on the target."
 
 ## Methodology note
 

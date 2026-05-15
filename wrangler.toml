@@ -1,5 +1,5 @@
 name = "tally"
-main = "build/worker/shim.mjs"
+main = "tally-worker/build/worker/shim.mjs"
 compatibility_date = "2026-05-13"
 compatibility_flags = ["http_request_timeout"]
 
@@ -15,4 +15,7 @@ tag = "v1"
 new_classes = ["TallyTeamDO"]
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+# worker-build must run from the tally-worker package directory; the
+# workspace root's Cargo.toml has no [package] section, which
+# worker-build rejects with "missing field `package`".
+command = "cargo install -q worker-build && cd tally-worker && worker-build --release"

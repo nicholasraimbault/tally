@@ -148,11 +148,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
       # Pre-build the worker so wrangler dev doesn't need to compile
       # on first request (which would push past the harness's 30s
-      # readiness timeout). worker-build emits to build/worker/shim.mjs
-      # — the wrangler.toml `main` entry.
+      # readiness timeout). worker-build emits to
+      # tally-worker/build/worker/shim.mjs — the wrangler.toml `main`
+      # entry. worker-build must run from the tally-worker package
+      # directory (the workspace root's Cargo.toml has no [package]
+      # section).
       - name: Install worker-build
         run: cargo install -q worker-build --locked
       - name: Build worker (release)
+        working-directory: tally-worker
         run: worker-build --release
       # Run the standalone test crate. The harness internally spawns
       # `wrangler dev --local` per test and tears it down on drop.

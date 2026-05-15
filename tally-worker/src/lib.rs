@@ -39,10 +39,11 @@ pub mod wake_router;
 pub mod wake_types;
 
 use crate::rpc::{
-    CompleteRequest, DispatchRequest, DispatchResponse, PublicCompleteRequest,
-    PublicCompleteResponse, PublicDispatchRequest, PublicDispatchResponse, PublicReadInboxResponse,
-    PublicRegisterRequest, PublicRegisterResponse, PublicWakeSummary, ReadInboxResponse,
-    RegisterRequest, UnregisterRequest, ValidateApiKeyRequest, ValidateApiKeyResponse,
+    CompleteRequest, DispatchRequest, DispatchResponse, InitTeamResponse, PublicCompleteRequest,
+    PublicCompleteResponse, PublicDispatchRequest, PublicDispatchResponse, PublicInitTeamResponse,
+    PublicReadInboxResponse, PublicRegisterRequest, PublicRegisterResponse, PublicRegisteredAgent,
+    PublicTeamStatusResponse, PublicWakeSummary, ReadInboxResponse, RegisterRequest,
+    TeamStatusResponse, UnregisterRequest, ValidateApiKeyRequest, ValidateApiKeyResponse,
 };
 
 /// Format a unix-millisecond timestamp as an ISO-8601 second-precision
@@ -131,6 +132,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             "/v1/teams/:team_id/wakes/:wake_id/complete",
             handle_complete,
         )
+        // CLI sub-PR Path A: team-administrative routes for operator-
+        // facing teams init/status/delete commands. Uniform-true Bearer
+        // auth (per cli-sub-pr-phase-0.md D5); no URL-path identity to
+        // match.
+        .post_async("/v1/teams/:team_id/init", handle_team_init)
+        .get_async("/v1/teams/:team_id/status", handle_team_status)
+        .delete_async("/v1/teams/:team_id", handle_team_delete)
         .run(req, env)
         .await
 }
@@ -634,6 +642,122 @@ async fn handle_complete(mut req: Request, ctx: RouteContext<()>) -> Result<Resp
             wake_id: wake_id_for_response,
         };
         Response::from_json(&public_resp)
+    } else {
+        let body_bytes = do_resp.bytes().await?;
+        Ok(Response::from_bytes(body_bytes)?.with_status(status))
+    }
+}
+
+// ─── CLI sub-PR Path A: team-administrative route handlers ────────────────
+//
+// Three public routes (init/status/delete) call into the DO's
+// `/team/*` sub-routes. Auth: uniform-true Bearer; no URL-path
+// identity, so `authenticate(..., None)` accepts any well-formed
+// Bearer per cli-sub-pr-phase-0.md D5.
+
+/// `POST /v1/teams/:team_id/init` handler.
+///
+/// Idempotent provisioning of the TallyTeamDO. `ensure_team_meta_initialized`
+/// runs on every DO `fetch` so first-touch is implicit; this route is
+/// an explicit acknowledgment of the lifecycle event plus a return of
+/// the team's metadata for the CLI to display. Public response shape
+/// per cli-sub-pr-phase-0.md "Runtime API surface gap — Path A locked"
+/// section.
+async fn handle_team_init(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let team_id = match ctx.param("team_id") {
+        Some(t) => t.to_string(),
+        None => return json_error_response(400, "missing team_id"),
+    };
+
+    let (stub, _identity_b64) = match authenticate(&req, &ctx.env, &team_id, None).await? {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(resp),
+    };
+
+    forward_and_translate_success::<InitTeamResponse, _>(
+        &stub,
+        Method::Post,
+        "/team/init",
+        None,
+        |internal_resp| {
+            let public_resp = PublicInitTeamResponse {
+                team_id: internal_resp.team_id_b64,
+                initialized_at: format_iso8601_utc(internal_resp.initialized_at_ms),
+                tenancy_prefix: internal_resp.tenancy_prefix,
+            };
+            Response::from_json(&public_resp)
+        },
+    )
+    .await
+}
+
+/// `GET /v1/teams/:team_id/status` handler.
+///
+/// Returns the team's TeamMeta + registered-agents summary + total
+/// inbox depth. The DO derives `registered_agents` by listing
+/// `agent:`-prefixed storage keys (no separate registered-agents index
+/// in MVP storage schema).
+async fn handle_team_status(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let team_id = match ctx.param("team_id") {
+        Some(t) => t.to_string(),
+        None => return json_error_response(400, "missing team_id"),
+    };
+
+    let (stub, _identity_b64) = match authenticate(&req, &ctx.env, &team_id, None).await? {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(resp),
+    };
+
+    forward_and_translate_success::<TeamStatusResponse, _>(
+        &stub,
+        Method::Get,
+        "/team/status",
+        None,
+        |internal_resp| {
+            let registered_agents = internal_resp
+                .registered_agents
+                .into_iter()
+                .map(|a| PublicRegisteredAgent {
+                    identity: a.identity_b64,
+                    contexts: a.contexts,
+                    inbox_depth: a.inbox_depth,
+                })
+                .collect();
+            let public_resp = PublicTeamStatusResponse {
+                team_id: internal_resp.team_id_b64,
+                initialized_at: format_iso8601_utc(internal_resp.initialized_at_ms),
+                tenancy_prefix: internal_resp.tenancy_prefix,
+                registered_agents,
+                total_inbox_depth: internal_resp.total_inbox_depth,
+            };
+            Response::from_json(&public_resp)
+        },
+    )
+    .await
+}
+
+/// `DELETE /v1/teams/:team_id` handler.
+///
+/// Clears all DO storage + scheduled alarm. Returns 204 No Content
+/// on success. Idempotent — repeated deletes on an already-empty DO
+/// trigger `ensure_team_meta_initialized` (writes fresh metadata) then
+/// `delete_all` again (wipes it).
+async fn handle_team_delete(req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let team_id = match ctx.param("team_id") {
+        Some(t) => t.to_string(),
+        None => return json_error_response(400, "missing team_id"),
+    };
+
+    let (stub, _identity_b64) = match authenticate(&req, &ctx.env, &team_id, None).await? {
+        Ok(pair) => pair,
+        Err(resp) => return Ok(resp),
+    };
+
+    let mut do_resp = forward_to_do(&stub, Method::Post, "/team/delete", None).await?;
+    let status = do_resp.status_code();
+    if (200..300).contains(&status) {
+        // DO returned 204 (empty body); pass through.
+        Ok(Response::empty()?.with_status(204))
     } else {
         let body_bytes = do_resp.bytes().await?;
         Ok(Response::from_bytes(body_bytes)?.with_status(status))

@@ -349,6 +349,95 @@ pub struct PublicCompleteResponse {
     pub wake_id: String,
 }
 
+// ─── Path A: Team-administrative route shapes (CLI sub-PR) ────────────────
+//
+// Phase 1B Sub-PR 3's CLI surface needs operator-facing teams init / status
+// / delete commands. The three new public routes (`POST /v1/teams/{id}/init`,
+// `GET /v1/teams/{id}/status`, `DELETE /v1/teams/{id}`) have no URL-path
+// identity, so authentication uses uniform-true Bearer (per cli-sub-pr-
+// phase-0.md D5): any well-formed Bearer is accepted at MVP. Phase 2 will
+// add team-admin tracking; wire contracts here stay stable across the
+// transition.
+
+/// Internal DO response for `POST /team/init`.
+///
+/// `/init` is idempotent. `ensure_team_meta_initialized` runs at the top
+/// of the DO's `fetch` handler so `team:meta` is guaranteed to exist by
+/// the time this handler reads it; the handler returns the (already-
+/// or just-now-initialized) TeamMeta. Repeated calls return the same
+/// `initialized_at_ms` — first-init time, not re-init time.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InitTeamResponse {
+    pub team_id_b64: String,
+    pub initialized_at_ms: u64,
+    pub tenancy_prefix: String,
+}
+
+/// Public response body for `POST /v1/teams/{team_id}/init`.
+///
+/// Translation from [`InitTeamResponse`]:
+/// - `team_id_b64` → `team_id` (the DO id hex, unchanged value)
+/// - `initialized_at_ms: u64` → `initialized_at: String` (ISO-8601 UTC)
+/// - `tenancy_prefix` flows through unchanged
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PublicInitTeamResponse {
+    pub team_id: String,
+    pub initialized_at: String,
+    pub tenancy_prefix: String,
+}
+
+/// Internal DO response for `GET /team/status`.
+///
+/// MVP shape: TeamMeta basics + per-agent registration summary +
+/// total inbox depth. Recent-wakes catalog deferred to a future
+/// status-expansion sub-PR (would require listing `wake:` keys
+/// with timestamp filtering — non-load-bearing for MVP).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TeamStatusResponse {
+    pub team_id_b64: String,
+    pub initialized_at_ms: u64,
+    pub tenancy_prefix: String,
+    pub registered_agents: Vec<RegisteredAgent>,
+    pub total_inbox_depth: u64,
+}
+
+/// Per-agent registration summary in the internal [`TeamStatusResponse`].
+///
+/// `contexts` is the agent's registered context_id set (the value of
+/// `agent:{identity_b64}:handlers`, materialized as a `Vec<String>` for
+/// the public shape). Empty `contexts` means the agent had handlers
+/// registered at some point but unregistered them all — the index key
+/// may persist as an empty `BTreeSet`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RegisteredAgent {
+    pub identity_b64: String,
+    pub contexts: Vec<String>,
+    pub inbox_depth: u64,
+}
+
+/// Public response body for `GET /v1/teams/{team_id}/status`.
+///
+/// Translation from [`TeamStatusResponse`]:
+/// - `team_id_b64` → `team_id`
+/// - `initialized_at_ms: u64` → `initialized_at: String` (ISO-8601 UTC)
+/// - per-agent [`RegisteredAgent`] → [`PublicRegisteredAgent`]
+///   (`identity_b64` → `identity`)
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PublicTeamStatusResponse {
+    pub team_id: String,
+    pub initialized_at: String,
+    pub tenancy_prefix: String,
+    pub registered_agents: Vec<PublicRegisteredAgent>,
+    pub total_inbox_depth: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PublicRegisteredAgent {
+    pub identity: String,
+    pub contexts: Vec<String>,
+    pub inbox_depth: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,15 @@
+# `getrandom_backend = "wasm_js"` rustflag — required for builds
+# targeting `wasm32-unknown-unknown` (Cloudflare Workers Durable Objects
+# runtime). `getrandom` 0.3 (pulled transitively by `ulid` per the
+# dispatch sub-PR's WakeId implementation) refuses to compile on
+# `wasm32-unknown-unknown` without both:
+#
+# 1. The `wasm_js` cargo feature on `getrandom` (declared as a direct
+#    dependency in `tally-worker/Cargo.toml`).
+# 2. This `--cfg getrandom_backend="wasm_js"` rustflag.
+#
+# Per https://docs.rs/getrandom/0.3.4/#webassembly-support, the feature
+# flag alone is insufficient; the rustflag selects the wasm-js backend
+# in `getrandom`'s build script.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

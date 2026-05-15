@@ -10,9 +10,11 @@
 
 use worker::*;
 
+pub mod dispatch_consts;
 pub mod durable_object;
 pub mod rpc;
 pub mod wake_router;
+pub mod wake_types;
 
 #[event(fetch)]
 async fn fetch(_req: Request, _env: Env, _ctx: Context) -> Result<Response> {

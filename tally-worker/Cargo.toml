@@ -20,10 +20,56 @@ worker = "0.5"
 # at time of writing). Canonical pattern per cloudflare/workers-rs
 # test/Cargo.toml which declares wasm-bindgen alongside worker.
 wasm-bindgen = "0.2"
+
+# js-sys: dispatch sub-PR Phase 0 Decision 5 requires constructing
+# the put_multiple_raw input via js_sys::Object + js_sys::Reflect to
+# avoid the serde_wasm_bindgen HashMap-as-Map serialization gotcha.
+# Pulled transitively by worker; declared directly for source-level
+# `use js_sys::{Object, Reflect}`.
+js-sys = "0.3"
+
+# serde-wasm-bindgen: bridges Rust serde types to JsValue for the
+# Reflect::set + put_multiple_raw write path (Decision 5). Pulled
+# transitively by worker (0.6.1); declared directly here so source
+# imports resolve. Version aligned with worker's transitive resolution.
+serde-wasm-bindgen = "0.6"
+
 tally-core = { workspace = true }
 stoa = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 async-trait = { workspace = true }
+
+# Dispatch sub-PR additions (Phase 0 Dependencies + constants section):
+# - serde_bytes: binary serialization for WakeRecord.payload and
+#   response_payload (Decision 8). serde_wasm_bindgen's default
+#   Vec<u8> path produces a JSON-style integer array (~3x size) at
+#   the storage layer; serde_bytes gives binary representation.
+# - ulid: WakeId (Decision 3). The `serde` feature enables ULID
+#   serde impls (used by WakeRecord). wasm32-compatible via the
+#   web-time crate (ulid pulls it transitively for clock source).
+# - base64: HTTP transport b64 encoding/decoding for payloads
+#   (already transitively present via stoa, declared direct here
+#   for source-level use).
+# - tokio with `sync` (oneshot::channel) and `time`
+#   (tokio::time::timeout safety wrapper per Decision 9).
+# - tracing: structured warn-level logs at the defensive-skip and
+#   invariant-violation surfaces (Phase 0 Decisions 5, 11; Locks
+#   2.6.8, 2.6.9). No platform-specific deps; wasm32-compatible.
+serde_bytes = "0.11"
+ulid = { version = "1", features = ["serde"] }
+base64 = "0.22"
+tokio = { version = "1", default-features = false, features = ["sync", "time"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+# getrandom 0.3 (transitive via ulid) requires the `wasm_js` feature on
+# the wasm32-unknown-unknown target — otherwise the build fails with
+# "The wasm32-unknown-unknown targets are not supported by default".
+# Direct dep so the feature flag flows into the dependency graph.
+# Also requires `--cfg getrandom_backend="wasm_js"` in .cargo/config.toml
+# (see the repo-level rustflags wiring there); enabling the feature
+# alone is insufficient per upstream docs.
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 # wasm-bindgen is invisible to cargo-machete because it's referenced
 # only via #[durable_object]'s macro expansion

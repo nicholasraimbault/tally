@@ -66,10 +66,15 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// 2. Test calls the helper methods (`register`, `dispatch`, etc.) or
 ///    builds requests directly via `harness.client` against
 ///    `harness.base_url`.
-/// 3. Drop sends SIGKILL to the subprocess. Tokio's `Child::start_kill`
-///    is best-effort; the OS reaps the process. Storage is
-///    `--persist-to`'d to a per-test tempdir which is cleaned up on
-///    drop separately.
+/// 3. Drop sends SIGKILL to the wrangler process group via
+///    `libc::kill(-pgid, SIGKILL)` (Unix). The spawn site uses
+///    `Command::process_group(0)` so wrangler is its own group leader
+///    (PGID = wrangler PID); workerd grandchildren inherit the PGID,
+///    so the group-signal propagates to them. The OS reaps; storage
+///    is `--persist-to`'d to a per-test tempdir cleaned up separately.
+///    See issue #26 for the leak this fix resolved (PR #25's
+///    verification cycle surfaced ~15GB memory pressure from leaked
+///    workerd grandchildren under the prior per-PID-only signal).
 ///
 /// # Concurrency model
 ///
@@ -168,8 +173,8 @@ impl TestHarness {
             .ok_or_else(|| anyhow!("CARGO_MANIFEST_DIR has no parent"))?
             .to_path_buf();
 
-        let wrangler_process = Command::new("wrangler")
-            .arg("dev")
+        let mut cmd = Command::new("wrangler");
+        cmd.arg("dev")
             .arg("--port")
             .arg(port.to_string())
             .arg("--local")
@@ -182,12 +187,23 @@ impl TestHarness {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Best-effort cleanup if test panics before TestHarness drop runs.
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                "spawn `wrangler dev` — is wrangler installed? Try `npm install -g wrangler`."
-                    .to_string()
-            })?;
+            .kill_on_drop(true);
+        // Process-group leadership for the wrangler child (Unix only):
+        // `process_group(0)` makes the child its own process-group
+        // leader (PGID = child PID). Any subprocess wrangler spawns
+        // (notably `workerd`, the actual HTTP server) inherits this
+        // PGID by default. The Drop impl then signals the whole group
+        // via `libc::kill(-pgid, SIGKILL)` to propagate cleanup to
+        // grandchildren. Without this, per-PID SIGKILL on wrangler
+        // alone left `workerd` running (~4GB RAM + port 8787 binding
+        // each), causing memory pressure across sequential test runs
+        // (issue #26, surfaced during PR #25's verification cycle).
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let wrangler_process = cmd.spawn().with_context(|| {
+            "spawn `wrangler dev` — is wrangler installed? Try `npm install -g wrangler`."
+                .to_string()
+        })?;
 
         let client = reqwest::Client::builder()
             // Long-poll dispatch blocks server-side for up to
@@ -491,15 +507,83 @@ impl TestHarness {
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
-        // tokio::process::Child has `start_kill`; this returns
-        // immediately (sends SIGKILL to the process group). We don't
-        // need to wait — the OS reaps the process; for tests that's
-        // fine. `kill_on_drop(true)` set during spawn ensures the
-        // subprocess also dies if the runtime is dropped before
-        // Drop fires. No-op in production-verification mode (no
+        // Cleanup the wrangler subprocess (default mode only).
+        //
+        // **Previously claimed to "send SIGKILL to the process group"
+        // via `process.start_kill()` — that was incorrect.**
+        // `tokio::process::Child::start_kill()` is equivalent to
+        // `kill -9 <pid>` (single PID), not `kill -9 -<pgid>` (group).
+        // `wrangler dev` spawns a `workerd` grandchild that inherited
+        // wrangler's process group but survived the per-PID SIGKILL
+        // — leaving the grandchild running (~4GB RAM + port 8787
+        // binding each), accumulating across sequential test runs
+        // until OOM-adjacent memory pressure surfaced (issue #26,
+        // observed during PR #25's verification cycle).
+        //
+        // Corrected approach (Unix): `libc::kill(-pgid, SIGKILL)`
+        // signals the entire process group. The spawn site uses
+        // `.process_group(0)` to make wrangler its own group leader
+        // (PGID = wrangler PID); workerd inherits wrangler's PGID by
+        // default, so signaling the group reaches both. Non-Unix
+        // platforms fall back to the original per-PID `start_kill()`
+        // (Windows is not a supported integration-test target, but
+        // the cfg gate keeps the crate compilable elsewhere).
+        //
+        // No-op in production-verification mode (env var set; no
         // subprocess to kill).
         if let Some(process) = self.wrangler_process.as_mut() {
+            #[cfg(unix)]
+            kill_process_group_best_effort(process);
+            #[cfg(not(unix))]
             let _ = process.start_kill();
+        }
+    }
+}
+
+/// Send `SIGKILL` to the wrangler subprocess's process group.
+///
+/// Targets the process group (pgid = wrangler PID, established via
+/// `Command::process_group(0)` at spawn time) so the kill propagates
+/// to wrangler's `workerd` grandchild. Best-effort: any failure
+/// other than `ESRCH` (no such process group — the expected case if
+/// wrangler exited cleanly before Drop) is logged via `eprintln` so
+/// the leak doesn't recur invisibly. We don't have `tracing`
+/// configured in the test harness; `eprintln` is the right idiom for
+/// surfacing surprises during test runs.
+#[cfg(unix)]
+fn kill_process_group_best_effort(process: &mut Child) {
+    let Some(pid) = process.id() else {
+        // Already reaped — nothing to signal.
+        return;
+    };
+    // Negative-PID convention: signal the process group whose PGID
+    // equals the absolute value. Defensive cast: PIDs are u32 in
+    // tokio's API but i32 on the syscall surface; the negation needs
+    // an i32 that fits. If the PID can't fit in i32 (effectively
+    // never on Linux with default pid_max=4_194_304), fall back to
+    // per-PID `start_kill` rather than corrupting the signal target.
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        let _ = process.start_kill();
+        return;
+    };
+    // SAFETY: `libc::kill` is an FFI call with a process group PID
+    // (negative) and a signal number; no Rust invariants involved.
+    // SIGKILL cannot be caught/ignored by the target, guaranteeing
+    // cleanup in bounded time.
+    let rc = unsafe { libc::kill(-pid_i32, libc::SIGKILL) };
+    if rc == -1 {
+        // SAFETY: `__errno_location` returns a pointer to the
+        // thread-local errno; reading it is safe.
+        let errno = unsafe { *libc::__errno_location() };
+        if errno != libc::ESRCH {
+            // Surprising failure (EPERM, EINVAL, etc.) — surface so
+            // the leak doesn't recur silently. ESRCH = no such
+            // process group (already exited); expected and quiet.
+            eprintln!(
+                "TestHarness: libc::kill(-{}, SIGKILL) failed with errno={}; \
+                 workerd may have leaked. Check `pgrep -af workerd` after this run.",
+                pid_i32, errno
+            );
         }
     }
 }

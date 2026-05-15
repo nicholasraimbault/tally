@@ -27,9 +27,10 @@ use stoa::{StoaError, WakeError};
 use tally_core::TeamMeta;
 
 use crate::dispatch_consts::{
-    INBOX_LIMIT, MAX_PAYLOAD_BYTES, MAX_RESPONSE_BYTES, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS,
-    SAFETY_BUFFER,
+    clamp_limit, clamp_wait_seconds, INBOX_LIMIT, MAX_PAYLOAD_BYTES, MAX_RESPONSE_BYTES,
+    MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, SAFETY_BUFFER,
 };
+use crate::error::TallyError;
 use crate::rpc::{
     CompleteRequest, DispatchRequest, DispatchResponse, OkResponse, ReadInboxQuery,
     ReadInboxResponse, RegisterRequest, UnregisterRequest, ValidateApiKeyRequest,
@@ -65,6 +66,17 @@ pub struct TallyTeamDO {
     /// Cloudflare DO eviction drops this; storage persists, alarm fires
     /// after rehydration, pending wakes route to TimedOut.
     pub(crate) wake_resolvers: HashMap<WakeId, oneshot::Sender<StdResult<WakeResponse, StoaError>>>,
+    /// In-memory map from target identity to the long-poll waiter's
+    /// oneshot `Sender` for inbox-arrival notifications.
+    ///
+    /// Per HTTP API surface sub-PR Phase 0 Decision 2: single-waiter
+    /// per identity. `handle_read_inbox` inserts when `wait_seconds > 0`
+    /// and the inbox is empty (subscribe-first ordering); the signal
+    /// site in [`TallyTeamDO::dispatch_with_caller`] removes the entry
+    /// post-storage and best-effort sends `()` to wake up the waiter.
+    /// Cloudflare DO eviction drops this map; waiting clients receive
+    /// `RecvError` and gracefully degrade to re-read.
+    pub(crate) inbox_waiters: HashMap<String, oneshot::Sender<()>>,
 }
 
 #[durable_object]
@@ -73,6 +85,7 @@ impl DurableObject for TallyTeamDO {
         Self {
             state,
             wake_resolvers: HashMap::new(),
+            inbox_waiters: HashMap::new(),
         }
     }
 
@@ -87,7 +100,14 @@ impl DurableObject for TallyTeamDO {
             (Method::Post, "/register") => self.handle_register(&mut req).await,
             (Method::Post, "/unregister") => self.handle_unregister(&mut req).await,
             (Method::Post, "/dispatch") => self.handle_dispatch(&mut req).await,
-            (Method::Get, p) if p.starts_with("/inbox") => self.handle_read_inbox(&req).await,
+            (Method::Get, p) if p.starts_with("/inbox/") => {
+                // HTTP API surface sub-PR Decision 3: identity is a
+                // routing parameter (URL path segment), not a query
+                // parameter. The Worker authenticates the caller and
+                // forwards the verified identity as `/inbox/{identity_b64}`.
+                let identity_b64 = p["/inbox/".len()..].to_string();
+                self.handle_read_inbox(&req, identity_b64).await
+            }
             (Method::Post, "/complete") => self.handle_complete_wake(&mut req).await,
             (Method::Post, "/validate_api_key") => self.handle_validate_api_key(&mut req).await,
             _ => Response::error("not found", 404),
@@ -596,10 +616,17 @@ impl TallyTeamDO {
             ))));
         }
 
-        // Inbox-waiter signal (Decision 7 operational notes; signal-only
-        // option c). Full subscription mechanism is §9.2 scope; the
-        // signal site lives here to document the seam.
-        // (No-op in this sub-PR.)
+        // Inbox-waiter signal per HTTP API surface sub-PR Phase 0
+        // Decision 2 (signal-only option c). If a `handle_read_inbox`
+        // call is long-polling on this target identity, the dispatch
+        // notifies it post-storage so the read can return populated.
+        //
+        // Best-effort: `sender.send(())` returning `Err(())` means the
+        // Receiver was dropped (subscriber timed out or was replaced by
+        // a newer subscribe). Not an error to log.
+        if let Some(sender) = self.inbox_waiters.remove(&target_b64) {
+            let _ = sender.send(());
+        }
 
         // ── Await resolution with safety timeout ──────────────────────
         // `tokio::time::timeout` is unusable on wasm32-unknown-unknown
@@ -669,12 +696,20 @@ impl TallyTeamDO {
             .await
         {
             Ok(()) => Response::from_json(&OkResponse),
-            Err(e) => Ok(stoa_error_to_response(&e)),
+            Err(e) => Ok(tally_error_to_response(&e)),
         }
     }
 
     /// Complete a pending wake — Pending → Completed transition per
     /// Phase 0 Lock 6.6.4 (β.1).
+    ///
+    /// Per HTTP API surface sub-PR Decision 4: returns `Result<(),
+    /// TallyError>` rather than `Result<(), StoaError>`. The three
+    /// implementation-specific error sites (wake row not found, wake
+    /// not Pending, by_identity mismatch) are not dispatch protocol
+    /// errors; they map to dedicated [`TallyError`] variants rather
+    /// than to fudged [`stoa::WakeError`] variants. See
+    /// `crate::error` for the full reasoning.
     ///
     /// Flow per Decision 5 (operation shape):
     /// 1. Pre-checks: deserialize-time identity/wake_id validation done
@@ -703,7 +738,7 @@ impl TallyTeamDO {
         wake_id: &WakeId,
         by_identity: &Identity,
         response_payload: Vec<u8>,
-    ) -> StdResult<(), StoaError> {
+    ) -> StdResult<(), TallyError> {
         // ── 2. Sequential reads ───────────────────────────────────────
         let wake = match self
             .state
@@ -712,25 +747,18 @@ impl TallyTeamDO {
             .await
         {
             Ok(r) => r,
-            Err(_) => return Err(StoaError::Wake(WakeError::HandlerNotFound)),
+            Err(_) => return Err(TallyError::WakeNotFound),
         };
 
         // ── 3. State guard ────────────────────────────────────────────
         if !matches!(wake.state, WakeState::Pending) {
-            return Err(StoaError::Wake(WakeError::DispatchRefused {
-                reason: format!(
-                    "wake is not Pending (current state: {:?}); cannot complete",
-                    wake.state
-                ),
-            }));
+            return Err(TallyError::AlreadyTerminal);
         }
 
         // ── 4. Identity guard ─────────────────────────────────────────
         let by_b64 = by_identity.to_url_safe_b64();
         if by_b64 != wake.target_identity {
-            return Err(StoaError::Wake(WakeError::DispatchRefused {
-                reason: "by_identity does not match wake.target_identity".to_string(),
-            }));
+            return Err(TallyError::IdentityMismatch);
         }
 
         // Continue sequential reads: alarm_queue, target inbox.
@@ -822,7 +850,16 @@ impl TallyTeamDO {
         }
     }
 
-    /// Validate API key — uniform-true in MVP per Phase 0 §4.4.
+    /// Validate API key — uniform-true MVP per HTTP API surface sub-PR
+    /// Phase 0 Decision 1.
+    ///
+    /// MVP behaviour: the DO attempts
+    /// [`Identity::from_url_safe_b64`] on the supplied bearer; on
+    /// success returns `{ valid: true, identity_b64: Some(bearer) }`;
+    /// on parse failure returns `{ valid: false, identity_b64: None }`.
+    /// Phase 2 will replace the parse-as-identity logic with a real
+    /// key lookup against `agent:{identity_b64}:api_keys`; the wire
+    /// contract is stable across the transition.
     ///
     /// MVP scope boundary: real authentication deferred to Phase 2 admin
     /// tooling. The plumbing exists for Phase 2 to fill in
@@ -831,61 +868,158 @@ impl TallyTeamDO {
     /// publicly-accessible environments without Phase 2 auth in place
     /// (Phase 0 §4.4 deployment boundary).
     async fn handle_validate_api_key(&mut self, req: &mut Request) -> Result<Response> {
-        let _body: ValidateApiKeyRequest = req.json().await?;
-        Response::from_json(&ValidateApiKeyResponse { valid: true })
+        let body: ValidateApiKeyRequest = req.json().await?;
+
+        // MVP: bearer is the URL-safe-base64 identity. Parse success →
+        // valid; parse failure → invalid.
+        match Identity::from_url_safe_b64(&body.bearer) {
+            Ok(_) => Response::from_json(&ValidateApiKeyResponse {
+                valid: true,
+                identity_b64: Some(body.bearer),
+            }),
+            Err(_) => Response::from_json(&ValidateApiKeyResponse {
+                valid: false,
+                identity_b64: None,
+            }),
+        }
     }
 
-    /// Read inbox immediate-read path per Phase 0 Decision 11 + Lock 6.6.6.
+    /// Read inbox per HTTP API surface sub-PR Phase 0 Decisions 2 + 3.
     ///
-    /// Parses identity from `?identity=...&wait_seconds=...&limit=...`.
-    /// Reads the inbox; for each wake_id, reads its wake row and
-    /// constructs a [`WakeSummary`]. Missing wake rows are defensively
-    /// skipped with a warn-log per Lock 2.6.9 (α.2 partial-failure orphan).
+    /// Per Decision 3: identity is no longer parsed from `?identity=`;
+    /// the Worker layer extracts it from the URL path and forwards it
+    /// here as a routing parameter (the second argument).
     ///
-    /// `wait_seconds` is accepted but ignored in this sub-PR — the
-    /// long-poll trigger (block until `inbox_waiters` signals) is
-    /// §9.2 scope.
-    async fn handle_read_inbox(&mut self, req: &Request) -> Result<Response> {
+    /// Per Decision 2: when `wait_seconds > 0` and the inbox is empty
+    /// after the initial read, subscribe to `inbox_waiters`
+    /// (subscribe-first ordering for correctness) and race the oneshot
+    /// Receiver against [`worker::Delay`] via
+    /// [`futures::future::select`]. The signal site is in
+    /// [`Self::dispatch_with_caller`]; cleanup on timeout is
+    /// unconditional (RecvError absorbed by the re-read path).
+    ///
+    /// Per §3.8: `limit` clamps to `[1, MAX_LIMIT]` with default
+    /// [`DEFAULT_LIMIT`]; the response carries `more_available: bool`
+    /// when the underlying inbox is longer than `limit`.
+    ///
+    /// Missing wake rows are defensively skipped with a warn-log per
+    /// Lock 2.6.9 (α.2 partial-failure orphan); a skipped row counts
+    /// against the limit (the inbox still references it) so
+    /// `more_available` reflects the storage state honestly.
+    async fn handle_read_inbox(&mut self, req: &Request, identity_b64: String) -> Result<Response> {
+        // Worker is responsible for the URL identity ↔ authenticated
+        // identity check (per Decision 3). Validate the b64 string here
+        // as a defence-in-depth check — if the Worker forwarded garbage,
+        // map it to a 400 rather than panicking.
+        let identity = match Identity::from_url_safe_b64(&identity_b64) {
+            Ok(id) => id,
+            Err(e) => return Response::error(format!("invalid identity: {}", e), 400),
+        };
+
         let url = req.url()?;
-        let mut identity_b64: Option<String> = None;
-        // `wait_seconds` and `limit` are accepted (forward-compat with
-        // §9.2's long-poll surface) but currently ignored. We parse them
-        // into a discarded `ReadInboxQuery` so malformed values surface
-        // no errors in this sub-PR; behaviour ties to §9.2 wire-up.
-        let mut _query = ReadInboxQuery {
+        let mut query = ReadInboxQuery {
             wait_seconds: None,
             limit: None,
         };
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
-                "identity" => identity_b64 = Some(value.into_owned()),
-                "wait_seconds" => _query.wait_seconds = value.parse().ok(),
-                "limit" => _query.limit = value.parse().ok(),
+                "wait_seconds" => query.wait_seconds = value.parse().ok(),
+                "limit" => query.limit = value.parse().ok(),
                 _ => {}
             }
         }
 
-        // Validate identity. The Decision 11 contract takes identity from
-        // the query string — convention is the dispatch sub-PR's compromise;
-        // §9.2 may revise.
-        let identity_b64 = match identity_b64 {
-            Some(s) => s,
-            None => return Response::error("missing identity query parameter", 400),
-        };
-        let _identity = match Identity::from_url_safe_b64(&identity_b64) {
-            Ok(id) => id,
-            Err(e) => return Response::error(format!("invalid identity: {}", e), 400),
-        };
+        // Clamp limit + wait_seconds per §3.8. We accept malformed
+        // (non-numeric) query values silently by treating them as None →
+        // default, matching the dispatch sub-PR's permissive parsing
+        // convention. The clamp logic lives in [`dispatch_consts`] as a
+        // host-testable helper.
+        let limit = clamp_limit(query.limit);
+        let wait_seconds = clamp_wait_seconds(query.wait_seconds);
 
-        let inbox: VecDeque<WakeId> = self
+        // Read the inbox.
+        let mut inbox: VecDeque<WakeId> = self
             .state
             .storage()
             .get(&inbox_key(&identity_b64))
             .await
             .unwrap_or_default();
 
-        let mut summaries = Vec::with_capacity(inbox.len());
-        for wid in inbox.iter() {
+        // Long-poll path per Decision 2: subscribe-first when inbox
+        // is empty and `wait_seconds > 0`. If signal fires or the
+        // re-read finds entries, fall through to the materialisation
+        // step with the now-populated inbox.
+        if inbox.is_empty() && wait_seconds > 0 {
+            let (tx, rx) = oneshot::channel::<()>();
+            self.inbox_waiters.insert(identity_b64.clone(), tx);
+
+            // Re-read AFTER insert: catches the case where dispatch
+            // appended between our initial read and our insert. The
+            // signal-side wouldn't find our entry yet, so the
+            // notification would otherwise be lost; the re-read catches
+            // the data directly.
+            inbox = self
+                .state
+                .storage()
+                .get(&inbox_key(&identity_b64))
+                .await
+                .unwrap_or_default();
+
+            if !inbox.is_empty() {
+                // Inbox populated during the subscribe window; remove
+                // our waiter and proceed.
+                self.inbox_waiters.remove(&identity_b64);
+            } else {
+                let delay = worker::Delay::from(Duration::from_secs(wait_seconds.into()));
+                match select(rx, delay).await {
+                    Either::Left((Ok(()), _)) => {
+                        // Signal fired; dispatch wrote to our inbox.
+                        // Re-read to materialise.
+                        inbox = self
+                            .state
+                            .storage()
+                            .get(&inbox_key(&identity_b64))
+                            .await
+                            .unwrap_or_default();
+                    }
+                    Either::Left((Err(_recv_error), _)) => {
+                        // Receiver dropped — most likely a replacement
+                        // subscribe-call dropped our Sender (or the
+                        // timeout path removed it). Re-read to
+                        // gracefully degrade; the race window is
+                        // bounded.
+                        inbox = self
+                            .state
+                            .storage()
+                            .get(&inbox_key(&identity_b64))
+                            .await
+                            .unwrap_or_default();
+                    }
+                    Either::Right(((), _receiver)) => {
+                        // Timeout fired. Unconditional remove of our
+                        // entry (Decision 2 operational notes). If a
+                        // newer subscriber raced in and replaced us,
+                        // they'll see RecvError on their Receiver and
+                        // route to the re-read path.
+                        self.inbox_waiters.remove(&identity_b64);
+                        // Empty response (inbox stayed empty for the
+                        // full long-poll window).
+                    }
+                }
+            }
+        }
+
+        // Suppress the unused-variable lint for `identity` — keep it
+        // bound for parsing/validation side-effects (defence-in-depth).
+        let _ = identity;
+
+        // Materialise WakeSummary entries up to `limit`. `more_available`
+        // is true iff the inbox holds more entries than we returned.
+        let inbox_len = inbox.len();
+        let more_available = inbox_len > limit;
+
+        let mut summaries = Vec::with_capacity(limit.min(inbox_len));
+        for wid in inbox.iter().take(limit) {
             match self.state.storage().get::<WakeRecord>(&wake_key(wid)).await {
                 Ok(wake) => summaries.push(WakeSummary {
                     wake_id: wid.to_string(),
@@ -907,27 +1041,60 @@ impl TallyTeamDO {
             }
         }
 
-        Response::from_json(&ReadInboxResponse { wakes: summaries })
+        Response::from_json(&ReadInboxResponse {
+            wakes: summaries,
+            more_available,
+        })
     }
 }
 
-/// Map a `StoaError` to a `Response` per Phase 0 §7.1 HTTP error code
-/// mapping.
-fn stoa_error_to_response(err: &StoaError) -> Response {
+/// Map a `StoaError` to a `Response` per HTTP API surface sub-PR
+/// Phase 0 §3.1 error code mapping.
+///
+/// Corrections relative to the dispatch sub-PR's mapping:
+/// - `HandlerNotFound` → 422 (was 404). The condition is "client
+///   request describes a handler that doesn't exist" — semantically
+///   "unprocessable" rather than "resource missing".
+/// - `DispatchRefused` → 422 (was 400). Same reasoning — semantic
+///   validity, not malformed input.
+/// - `TimeoutExpired` → 408 (was 504). The wake timeout is the
+///   client's requested timeout; 408 (Request Timeout) is the
+///   conventional code for client-supplied-deadline exceeded.
+pub(crate) fn stoa_error_to_response(err: &StoaError) -> Response {
     let response = match err {
         StoaError::Wake(WakeError::HandlerNotFound) => Response::error(
             "target identity has no eligibility registered for context",
-            404,
+            422,
         ),
         StoaError::Wake(WakeError::DispatchRefused { reason }) => {
-            Response::error(format!("dispatch refused: {}", reason), 400)
+            Response::error(format!("dispatch refused: {}", reason), 422)
         }
-        StoaError::Wake(WakeError::TimeoutExpired { .. }) => Response::error("wake timed out", 504),
+        StoaError::Wake(WakeError::TimeoutExpired { .. }) => Response::error("wake timed out", 408),
         StoaError::Wake(WakeError::InvalidTimeout) => Response::error("timeout must be > 0", 400),
         StoaError::Wake(WakeError::Other(msg)) => {
             Response::error(format!("internal error: {}", msg), 500)
         }
         _ => Response::error("internal error", 500),
+    };
+    response.unwrap_or_else(|_| Response::empty().unwrap())
+}
+
+/// Map a [`TallyError`] to a `Response` per HTTP API surface sub-PR
+/// Phase 0 §3.1.
+///
+/// Delegates [`TallyError::Stoa`] to [`stoa_error_to_response`] so the
+/// dispatch-scoped error mapping stays in one place. Tally-specific
+/// variants:
+/// - [`TallyError::WakeNotFound`] → 404 (the wake row doesn't exist)
+/// - [`TallyError::AlreadyTerminal`] → 410 (gone; resource lifecycle ended)
+/// - [`TallyError::IdentityMismatch`] → 403 (forbidden; auth identity ≠
+///   wake's target)
+pub(crate) fn tally_error_to_response(err: &TallyError) -> Response {
+    let response = match err {
+        TallyError::Stoa(stoa_err) => return stoa_error_to_response(stoa_err),
+        TallyError::WakeNotFound => Response::error("wake not found", 404),
+        TallyError::AlreadyTerminal => Response::error("wake already in terminal state", 410),
+        TallyError::IdentityMismatch => Response::error("identity does not match wake target", 403),
     };
     response.unwrap_or_else(|_| Response::empty().unwrap())
 }

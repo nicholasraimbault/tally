@@ -1,0 +1,69 @@
+[package]
+name = "tally-cli"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+repository = "https://github.com/nicholasraimbault/tally"
+description = "Operator/team/agent CLI for the Tally Cloudflare runtime."
+
+# Standalone crate — opts out of the workspace.
+#
+# tally-worker is wasm32-only cdylib; pulling tokio/reqwest into the
+# workspace would break its wasm build (same reasoning as
+# integration-tests/). The standalone crate isolates the CLI's
+# host-target dependency surface from the worker.
+#
+# Per cli-sub-pr-phase-0.md D11: spec-listed skytale-sdk + stoa-rs deps
+# are NOT required by the MVP command set (no command imports their
+# types) and are omitted here to keep `cargo machete` clean — matching
+# the discipline established in PR #20 where unused `humantime` was
+# removed. If Phase 2 commands import skytale-sdk types (e.g., a
+# hypothetical `tally teams roster` that reads upstream Stoa
+# membership), the dep lands then.
+[workspace]
+
+[[bin]]
+name = "tally"
+path = "src/main.rs"
+
+[lib]
+name = "tally_cli"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI arg parsing.
+clap = { version = "4", features = ["derive"] }
+
+# HTTP client for talking to the deployed Tally runtime. `json` feature
+# enables `.json()` body builders + `Response::json` deserialization.
+reqwest = { version = "0.12", features = ["json"] }
+
+# Async runtime. reqwest requires it; `tally` is a sync-from-the-
+# user's-perspective CLI but each command's body uses `#[tokio::main]`
+# (or block_on) to drive the HTTP client.
+tokio = { version = "1", features = ["full"] }
+
+# Locate the operator's home directory for `~/.tally/` config paths.
+dirs = "6"
+
+# url-safe-base64 encoding for the operator identity stored at
+# ~/.tally/identity (raw 32-byte ed25519 secret seed → url-safe-b64
+# string).
+base64 = "0.22"
+
+# Internal error chaining. Command boundaries convert anyhow::Result
+# into Result<(), String> per D7 (the boundary is in main.rs's
+# dispatch site).
+anyhow = "1"
+
+# Phase 2 deps (ed25519-dalek + rand_core for keypair generation;
+# serde + serde_json for HTTP request/response DTOs) are added in the
+# next commit when command implementations need them. Splitting keeps
+# cargo-machete clean at this commit boundary per the discipline
+# established by PR #20's humantime removal.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

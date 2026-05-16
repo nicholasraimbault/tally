@@ -9,7 +9,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license-file = "LICENSE"
-repository = "https://github.com/nicholasraimbault/tally"
+repository = "https://github.com/nicholasraimbault/tally-workers"
 
 [workspace.dependencies]
 # Internal

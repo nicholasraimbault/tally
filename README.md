@@ -1,11 +1,16 @@
-# Tally
+# Tally Workers
 
-Cloudflare-hosted runtime for the Stoa agent-coordination protocol.
+Cloudflare-hosted runtime for the Stoa agent-coordination protocol. The dispatch substrate that powers [Tally Coding](https://github.com/nicholasraimbault/tally-coding) and (potentially) other Tally products.
 
-Tally implements [Stoa](https://github.com/nicholasraimbault/skytale)'s
+Tally Workers implements [Stoa](https://github.com/nicholasraimbault/skytale)'s
 `WakeRouter` trait on Cloudflare Workers + Durable Objects. It's the first
 product on the Stoa protocol layer extracted via Option B (skytale issue
 [#431](https://github.com/nicholasraimbault/skytale/issues/431)).
+
+## Sibling products
+
+- **[Tally Coding](https://github.com/nicholasraimbault/tally-coding)** — privacy-first AI coding team platform; native apps on every device; cloud-primary agents; E2E-encrypted team chat. Consumes Tally Workers as the wake-routing substrate. BSL 1.1 (same license family as this repo).
+- **[Skytale](https://github.com/nicholasraimbault/skytale)** — open-source primitives (Apache 2.0). E2E encryption for AI agents (MLS RFC 9420), SDKs (Python, Rust, TypeScript), relay, REST API, and the Stoa protocol-interface crate that Tally Workers implements.
 
 ## Status
 

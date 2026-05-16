@@ -3,7 +3,7 @@ name = "tally-cli"
 version = "0.1.0"
 edition = "2021"
 license-file = "../LICENSE"
-repository = "https://github.com/nicholasraimbault/tally"
+repository = "https://github.com/nicholasraimbault/tally-workers"
 description = "Operator/team/agent CLI for the Tally Cloudflare runtime."
 
 # Standalone crate — opts out of the workspace.

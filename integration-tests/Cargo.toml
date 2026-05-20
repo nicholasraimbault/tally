@@ -3,6 +3,7 @@ name = "tally-integration-tests"
 version = "0.0.0"
 edition = "2021"
 publish = false
+license-file = "../LICENSE"
 description = "End-to-end integration tests for tally's public HTTP API surface. Standalone crate that drives a `wrangler dev` subprocess via reqwest. See `docs/specs/integration-tests-sub-pr-test-plan.md` for scope and scenario catalog."
 
 # Standalone crate — opts out of the workspace. Test-only dependencies
